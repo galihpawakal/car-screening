@@ -1,0 +1,35 @@
+# Environment & secrets
+.env
+.env.*
+*.env
+.streamlit/secrets.toml
+secrets.toml
+data/analysis_cache.sqlite3
+data/analysis_cache.sqlite3-shm
+data/analysis_cache.sqlite3-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model artifacts (optional - keep if you want to track models)
+# models/*.joblib
+
+# Logs
+*.log
