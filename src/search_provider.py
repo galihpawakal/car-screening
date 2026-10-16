@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from google import genai
+from google.genai import types
 
 try:
     from dotenv import load_dotenv
@@ -277,7 +279,18 @@ class GeminiGroundingProvider(SearchProvider):
         if client is None:
             api_key, configured_model, configured_fallbacks = get_gemini_settings()
             self.api_keys = get_all_gemini_api_keys() or [api_key]
-            self.clients = [genai.Client(api_key=k) for k in self.api_keys]
+            http_opts = None
+            try:
+                http_opts = types.HttpOptions(
+                    timeout=12_000,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                )
+            except Exception:
+                pass
+            self.clients = [
+                genai.Client(api_key=k, http_options=http_opts) if http_opts else genai.Client(api_key=k)
+                for k in self.api_keys
+            ]
             self.client_index = 0
             self.client = self.clients[0]
             self.model = model or configured_model
@@ -316,28 +329,37 @@ class GeminiGroundingProvider(SearchProvider):
         self._lock = threading.Lock()
         self._exhausted_client_indices: set[int] = set()
 
-    def _next_client(self) -> tuple[Any, int]:
+    def _next_available_client(self) -> tuple[Any, int] | None:
         with self._lock:
             clients = getattr(self, "clients", None)
             if not clients:
                 return self.client, 0
             total = len(clients)
-            if total <= 1:
-                return clients[0], 0
             for offset in range(total):
                 idx = (self.client_index + offset) % total
                 if idx not in self._exhausted_client_indices:
-                    self.client_index = (idx + 1) % total
                     return clients[idx], idx
-            # If all are marked exhausted, reset to allow retry across keys
-            self._exhausted_client_indices.clear()
-            idx = self.client_index % total
-            self.client_index = (idx + 1) % total
-            return clients[idx], idx
+            return None
 
     def _mark_client_exhausted(self, idx: int) -> None:
         with self._lock:
             self._exhausted_client_indices.add(idx)
+            total = len(getattr(self, "clients", [1]))
+            if total > 1:
+                self.client_index = (idx + 1) % total
+
+    def find_first_available_key(self, model: str = "") -> int | None:
+        """Find the first API key not yet marked exhausted in memory, avoiding wasteful probe API calls."""
+        clients = getattr(self, "clients", None)
+        if not clients or len(clients) <= 1:
+            return 0 if 0 not in self._exhausted_client_indices else None
+
+        total = len(clients)
+        for offset in range(total):
+            idx = (self.client_index + offset) % total
+            if idx not in self._exhausted_client_indices:
+                return idx
+        return None
 
     def _notify(self, message: str) -> None:
         if self.on_status and callable(self.on_status):
@@ -356,74 +378,128 @@ class GeminiGroundingProvider(SearchProvider):
     def _request(self, **kwargs):
         candidates = self._candidate_models()
         last_error: Exception | None = None
+        total_clients = len(getattr(self, "clients", [1]))
+
         for candidate_model in candidates:
-            for attempt in range(self.max_retries):
-                self.api_calls += 1
-                tools = kwargs.get("tools")
-                action_desc = "sedang menelusuri listing di web" if tools else "memproses data terstruktur"
-                active_client, client_idx = self._next_client()
-                total_clients = len(getattr(self, "clients", [1]))
-                key_tag = f" (key #{client_idx + 1}/{total_clients})" if total_clients > 1 else ""
-                self._notify(
-                    f"🌐 Menghubungi model `{candidate_model}`{key_tag} ({action_desc}, percobaan {attempt + 1}/{self.max_retries})..."
-                )
-                try:
-                    response = active_client.interactions.create(model=candidate_model, **kwargs)
-                    self.active_model = candidate_model
-                    self.last_used_model = candidate_model
-                    self.attempt_history.append(
-                        {"model": candidate_model, "attempt": attempt + 1, "success": True, "error": None}
-                    )
-                    self._notify(f"✅ Model `{candidate_model}` berhasil merespons.")
-                    return response, candidate_model
-                except Exception as error:
-                    last_error = error
-                    err_msg = str(error)
-                    is_daily_exhausted = "RESOURCE_EXHAUSTED" in err_msg and (
-                        "limit:" in err_msg or "free_tier" in err_msg or "quota" in err_msg.lower()
-                    )
-                    if is_daily_exhausted:
-                        self._mark_client_exhausted(client_idx)
-                        if total_clients > 1 and len(self._exhausted_client_indices) < total_clients:
-                            self._notify(
-                                f"⚠️ API key #{client_idx + 1} kehabisan kuota harian. Beralih ke API key lain..."
-                            )
-                            continue
-                        raise RuntimeError(
-                            f"Semua API key Gemini ({total_clients} key) telah mencapai batas kuota harian free tier (20 request/hari). "
-                            "Silakan gunakan API key baru / Pay-as-you-go atau tunggu reset kuota harian dari Google."
-                        )
-
-                    is_retry = _is_retryable(error)
-                    self.attempt_history.append(
-                        {
-                            "model": candidate_model,
-                            "attempt": attempt + 1,
-                            "success": False,
-                            "error": err_msg,
-                            "retryable": is_retry,
-                        }
-                    )
-
-                    if attempt + 1 < self.max_retries and is_retry:
-                        delay = self.backoff_seconds * (2**attempt) + random.uniform(
-                            0, max(0.01, self.backoff_seconds / 2) if self.backoff_seconds > 0 else 0
-                        )
-                        self._notify(
-                            f"⚠️ Model `{candidate_model}` terkendala ({error}). Menunggu jeda {delay:.1f} detik untuk retry..."
-                        )
-                        if delay > 0:
-                            time.sleep(delay)
-                        continue
+            # Fast scan to find an available API key without hanging on exhausted keys
+            if total_clients > 1:
+                available_idx = self.find_first_available_key(candidate_model)
+                if available_idx is None:
                     if candidates.index(candidate_model) + 1 < len(candidates):
                         next_model = candidates[candidates.index(candidate_model) + 1]
                         self._notify(
-                            f"🔄 Percobaan pada `{candidate_model}` selesai. Beralih ke model cadangan: `{next_model}`..."
+                            f"🔄 Seluruh key kuota habis pada `{candidate_model}`. Beralih ke model cadangan: `{next_model}`..."
                         )
+                        continue
                     break
 
+            checked_indices: set[int] = set()
+            while len(checked_indices) < total_clients:
+                client_info = self._next_available_client()
+                if client_info is None:
+                    break
+
+                active_client, client_idx = client_info
+                if client_idx in checked_indices:
+                    break
+                checked_indices.add(client_idx)
+
+                key_tag = f" (key #{client_idx + 1}/{total_clients})" if total_clients > 1 else ""
+                tools = kwargs.get("tools")
+                action_desc = "sedang menelusuri listing di web" if tools else "memproses data terstruktur"
+                self._notify(
+                    f"🌐 Menghubungi model `{candidate_model}`{key_tag} ({action_desc})..."
+                )
+
+                key_failed = False
+                for attempt in range(self.max_retries):
+                    self.api_calls += 1
+                    try:
+                        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        future = executor.submit(active_client.interactions.create, model=candidate_model, **kwargs)
+                        try:
+                            response = future.result(timeout=12.0)
+                        finally:
+                            executor.shutdown(wait=False)
+
+                        self.active_model = candidate_model
+                        self.last_used_model = candidate_model
+                        self.attempt_history.append(
+                            {"model": candidate_model, "attempt": attempt + 1, "success": True, "error": None}
+                        )
+                        self._notify(f"✅ Model `{candidate_model}` berhasil merespons via key #{client_idx + 1}.")
+                        with self._lock:
+                            self.client_index = client_idx
+                        return response, candidate_model
+                    except concurrent.futures.TimeoutError:
+                        self._mark_client_exhausted(client_idx)
+                        remaining = total_clients - len(self._exhausted_client_indices)
+                        self._notify(
+                            f"⚠️ Key #{client_idx + 1} tidak merespons (timeout 12s). Langsung beralih ke key berikutnya ({remaining} key tersisa)..."
+                        )
+                        key_failed = True
+                        break
+                    except Exception as error:
+                        last_error = error
+                        err_msg = str(error)
+                        is_quota_exhausted = (
+                            "RESOURCE_EXHAUSTED" in err_msg
+                            or "429" in err_msg
+                            or "too_many_requests" in err_msg
+                            or "quota" in err_msg.lower()
+                            or "limit:" in err_msg
+                            or "per day" in err_msg.lower()
+                        )
+                        if is_quota_exhausted:
+                            self._mark_client_exhausted(client_idx)
+                            remaining = total_clients - len(self._exhausted_client_indices)
+                            if remaining > 0:
+                                self._notify(
+                                    f"⚠️ API key #{client_idx + 1} kuota habis/tidak tersedia. Langsung beralih ke key berikutnya ({remaining} key tersisa)..."
+                                )
+                            else:
+                                self._notify(
+                                    f"⚠️ API key #{client_idx + 1} kuota habis. Seluruh {total_clients} API key telah habis."
+                                )
+                            key_failed = True
+                            break
+
+                        is_retry = _is_retryable(error)
+                        self.attempt_history.append(
+                            {
+                                "model": candidate_model,
+                                "attempt": attempt + 1,
+                                "success": False,
+                                "error": err_msg,
+                                "retryable": is_retry,
+                            }
+                        )
+
+                        if attempt + 1 < self.max_retries and is_retry:
+                            delay = self.backoff_seconds * (2**attempt)
+                            self._notify(
+                                f"⚠️ Key #{client_idx + 1} terkendala ({error}). Menunggu jeda {delay:.1f} detik untuk retry..."
+                            )
+                            if delay > 0:
+                                time.sleep(delay)
+                            continue
+                        else:
+                            key_failed = True
+                            break
+
+                if key_failed:
+                    continue
+
+            if candidates.index(candidate_model) + 1 < len(candidates):
+                next_model = candidates[candidates.index(candidate_model) + 1]
+                self._notify(
+                    f"🔄 Model `{candidate_model}` tidak tersedia. Beralih ke model cadangan: `{next_model}`..."
+                )
+
         models_tried = ", ".join(candidates)
-        raise RuntimeError(f"Semua model Gemini ({models_tried}) gagal setelah retry. Error terakhir: {last_error}") from last_error
+        raise RuntimeError(
+            f"Semua model Gemini ({models_tried}) gagal setelah retry. Error terakhir: {last_error}"
+        ) from last_error
 
     def search(self, prompt: str, *, marketplace: str = "") -> GroundedSearchResult:
         self._notify("🔍 Menjalankan pencarian web Google Search grounding...")

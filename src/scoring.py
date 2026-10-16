@@ -80,21 +80,36 @@ def get_market_confidence(
     price_spread_ratio: float | None,
     completeness_pct: float,
 ) -> dict[str, str]:
-    """Classify estimate confidence from source count, price spread, and input completeness."""
+    """Classify estimate confidence from source count, price spread, and input completeness.
+
+    Ambang tingkat keyakinan:
+      < 2   -> Sangat rendah (skor tidak dihitung)
+      2     -> Rendah (indikatif)
+      3-5   -> Sedang
+      >= 6  -> Tinggi
+    """
     spread = price_spread_ratio if price_spread_ratio is not None else 1.0
-    if count < SOLID_COMPARABLES:
+    if count < MIN_COMPARABLES:  # < 2
+        return {
+            "level": "Sangat rendah",
+            "reason": f"Data pembanding kurang dari {MIN_COMPARABLES} ({count}); skor tidak dihitung dan rentang harga berkeyakinan sangat rendah.",
+        }
+    if count < SOLID_COMPARABLES:  # 2
         return {
             "level": "Rendah",
-            "reason": f"Data pembanding kurang dari {SOLID_COMPARABLES} ({count}); rentang harga tidak cukup kuat untuk keputusan.",
+            "reason": f"Data pembanding kurang dari {SOLID_COMPARABLES} ({count}); estimasi bersifat indikatif (data sedikit).",
         }
-    if count >= 10 and spread <= 0.20 and completeness_pct >= 80:
-        level = "Tinggi"
-    elif count >= 5 and spread <= 0.35 and completeness_pct >= 60:
-        level = "Sedang"
-    else:
-        level = "Rendah"
+    if count < 6:  # 3-5
+        return {
+            "level": "Sedang",
+            "reason": (
+                f"Berdasarkan {count} pembanding, sebaran harga {spread:.0%}, "
+                f"dan kelengkapan input {completeness_pct:.0f}%."
+            ),
+        }
+    # >= 6
     return {
-        "level": level,
+        "level": "Tinggi",
         "reason": (
             f"Berdasarkan {count} pembanding, sebaran harga {spread:.0%}, "
             f"dan kelengkapan input {completeness_pct:.0f}%."
@@ -281,7 +296,9 @@ def insufficient_data_screening_result(
     """Return a non-numeric screening outcome when comparables are below MIN_COMPARABLES."""
     from src.rules import merge_and_deduplicate_flags
 
-    llm_red_flags = llm_red_flags or []
+    # Red flag "harga di bawah pasar / mencurigakan" TIDAK boleh muncul jika pembanding valid < 3
+    rule_flags = [f for f in rule_flags if f.code != "PRICE_TOO_LOW" and "mencurigakan" not in f.message.lower()]
+    llm_red_flags = [f for f in (llm_red_flags or []) if "harga" not in f.lower() and "murah" not in f.lower() and "mencurigakan" not in f.lower()]
     all_flags = merge_and_deduplicate_flags(rule_flags, llm_red_flags)
     info_comp = calculate_info_completeness_score(has_description, has_varian, has_plate, has_location)
     desc_comp = calculate_description_risk_score(all_flags, 0.0, llm_red_flags, has_description=has_description)
@@ -290,14 +307,14 @@ def insufficient_data_screening_result(
             name="Kewajaran Harga",
             score=-1,
             weight=SCORING_WEIGHTS["price_fairness"],
-            reason=f"Pembanding valid kurang dari {MIN_COMPARABLES}; skor harga tidak dihitung",
+            reason="Data pembanding terlalu sedikit untuk menilai kewajaran harga.",
             assessed=False,
         ),
         ScoreComponent(
             name="Kewajaran KM vs Umur",
             score=-1,
             weight=SCORING_WEIGHTS["km_age_fairness"],
-            reason=f"Pembanding valid kurang dari {MIN_COMPARABLES}; skor KM tidak dihitung",
+            reason="Data pembanding terlalu sedikit untuk menilai kewajaran KM vs umur.",
             assessed=False,
         ),
         info_comp,
@@ -478,7 +495,12 @@ def format_screening_result(result: ScreeningResult) -> dict:
 
 
 def negotiation_advice_text(price_diff_pct: float, n_comparables: int) -> str | None:
-    """Return advisory text when listing is below market; None when negotiation makes sense."""
+    """Return advisory text when comparables < 3 or listing is below market; None when negotiation makes sense."""
+    if n_comparables < 3:
+        return (
+            "Belum ada cukup pembanding untuk saran tawar. "
+            "Gunakan harga transaksi aktual 3-10% di bawah listing sebagai acuan umum dan verifikasi langsung."
+        )
     if price_diff_pct <= 0:
         return (
             "Harga sudah di bawah pembanding; tidak ada saran tawar turun. "
@@ -487,9 +509,10 @@ def negotiation_advice_text(price_diff_pct: float, n_comparables: int) -> str | 
     return None
 
 
-def price_banner_warning(listing_price: int, price_median: int) -> str | None:
-    """Return a banner warning if listing price is <50% of median, else None."""
-    if price_median > 0 and listing_price < price_median * 0.50:
+
+def price_banner_warning(listing_price: int, price_median: int, n_comparables: int = 10) -> str | None:
+    """Return a banner warning if listing price is <50% of median and comparables >= 3, else None."""
+    if n_comparables >= MIN_COMPARABLES and price_median > 0 and listing_price < price_median * 0.50:
         return (
             "⚠️ Harga yang Anda masukkan jauh di bawah pasar. "
             "Periksa apakah sudah benar (salah ketik?) atau waspadai penipuan."

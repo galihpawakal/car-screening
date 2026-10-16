@@ -70,6 +70,19 @@ def _format_price(price: int) -> str:
     return f"Rp {price:,.0f}".replace(",", ".")
 
 
+def _format_price_compact(price: int | float | None) -> str:
+    """Format price in millions (jt) or billions (M) to avoid UI clipping."""
+    if price is None:
+        return "-"
+    if price >= 1_000_000_000:
+        val = price / 1_000_000_000
+        return f"Rp {val:.2f} M".replace(".00", "").replace(".", ",")
+    val = price / 1_000_000
+    if val.is_integer():
+        return f"Rp {int(val)} jt"
+    return f"Rp {val:.1f} jt".replace(".", ",")
+
+
 def _daily_limit() -> int:
     value = os.environ.get("DAILY_ANALYSIS_LIMIT")
     if not value:
@@ -111,10 +124,21 @@ def _read_listing_form() -> dict:
             height=140,
             placeholder="Tempel informasi kondisi, riwayat servis, pajak, dan dokumen jika tersedia.",
         )
+        search_mode_label = st.radio(
+            "Metode Pencarian *",
+            options=[
+                "Pencarian Langsung Marketplace (Default - Bebas Kuota AI)",
+                "Google Search Grounding (Gemini AI)",
+            ],
+            index=0,
+            help="Pencarian Langsung membaca katalog Carsome & Carmudi secara otomatis tanpa memakan kuota AI. Google Search Grounding mencari via web search.",
+        )
+        search_mode = "direct" if "Langsung" in search_mode_label else "grounding"
+
         manual_urls = st.text_area(
             "Tempel URL listing pembanding (opsional, maks 10)",
-            height=100,
-            placeholder="Satu URL per baris. Lewati pencarian Google jika diisi.",
+            height=90,
+            placeholder="Biarkan kosong untuk pencarian otomatis, atau tempel URL listing khusus per baris.",
         )
         analyze = st.button("Analisa", type="primary", width="stretch", icon=":material/search:")
     return {
@@ -130,7 +154,7 @@ def _read_listing_form() -> dict:
         "plate_code": plate_code,
         "deskripsi": description.strip(),
         "manual_listing_urls": manual_urls.strip(),
-        "plate_code": plate_code,
+        "search_mode": search_mode,
     }, analyze
 
 
@@ -228,19 +252,33 @@ def _render_market_chart(result: ScreeningPipelineResult, listing_price: int) ->
 
 
 def _render_comparables(result: ScreeningPipelineResult, listing_price: int) -> None:
+    if getattr(result, "tier_label", None):
+        st.info(f"ℹ️ **Status Tingkatan Data**: Pembanding diambil dari {result.tier_label}.")
+
     rows = []
     for item in result.comparables:
+        # Hanya sertakan baris dari halaman detail
+        if getattr(item, "page_type", "detail") != "detail":
+            continue
         diff_pct = (item.price - listing_price) / listing_price * 100 if listing_price else 0
         domain = urlsplit(item.source_url).netloc if item.source_url else "-"
+        tier_val = getattr(item, "tier", 1)
+        tier_display = f"Tier {tier_val}"
+        if getattr(item, "is_twin_model", False):
+            tier_display += " (Kembar)"
+        weight_val = getattr(item, "weight", 1.0)
+        note_val = getattr(item, "notes", "") or "-"
         rows.append({
             "Merek/Model/Varian": f"{item.brand} {item.model} {item.variant}".strip(),
+            "Tier": tier_display,
+            "Bobot": f"{weight_val:.1f}",
             "Tahun": item.year if item.year is not None else "tidak diketahui",
-            "KM": f"{item.kilometer:,}" if item.kilometer is not None else "tidak diketahui",
+            "KM": f"{item.kilometer:,}" + (" (est)" if getattr(item, "is_km_estimated", False) else ""),
             "Lokasi": item.location,
             "Harga": _format_price(item.price),
             "Selisih %": diff_pct,
+            "Catatan": note_val,
             "Sumber": item.source_url,
-            "Domain": domain,
             "Tanggal ambil": item.fetched_at[:10] if item.fetched_at else "-",
         })
     if not rows:
@@ -251,12 +289,13 @@ def _render_comparables(result: ScreeningPipelineResult, listing_price: int) -> 
         table,
         width="stretch",
         hide_index=True,
-        alt="Listing pembanding ter-grounding, harga, selisih, tautan, dan tanggal pengambilan",
+        alt="Listing pembanding ter-grounding dari halaman detail, harga, selisih, tautan, dan tanggal pengambilan",
         column_config={
             "Selisih %": st.column_config.NumberColumn(format="%+.1f%%"),
             "Sumber": st.column_config.LinkColumn(display_text="Buka listing"),
         },
     )
+
 
 
 def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_button) -> None:
@@ -269,6 +308,15 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
         f"{user_input['location']} | Plat {user_input['plate_code']}"
     )
     st.write(f"Harga listing: **{_format_price(user_input['listing_price'])}**")
+
+    if getattr(result, "funnel_metrics", None):
+        fm = result.funnel_metrics
+        st.markdown("##### 📊 Funnel Pengambilan Data Pembanding")
+        f1, f2, f3, f4 = st.columns(4)
+        f1.metric("Katalog Dibuka", fm.get("catalog_urls_opened", 0))
+        f2.metric("Tautan Ditemukan", fm.get("detail_links_found", 0))
+        f3.metric("Detail Terbaca", fm.get("detail_pages_parsed", 0))
+        f4.metric("Lolos Validasi", fm.get("valid_comparables", 0))
 
     model_display = result.model_used or "Gemini"
     if result.warning:
@@ -295,9 +343,21 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
             n_count = stats["count"]
             range_label = "min/max" if n_count < SOLID_COMPARABLES else "P25/P75"
             low_col, median_col, high_col = st.columns(3)
-            low_col.metric(f"Rendah ({range_label.split('/')[0]})", _format_price(stats["price_low"]))
-            median_col.metric("Tengah (median)", _format_price(stats["price_median"]))
-            high_col.metric(f"Tinggi ({range_label.split('/')[1]})", _format_price(stats["price_high"]))
+            low_col.metric(
+                f"Rendah ({range_label.split('/')[0]})",
+                _format_price_compact(stats["price_low"]),
+                help=_format_price(stats["price_low"]),
+            )
+            median_col.metric(
+                "Tengah (median)",
+                _format_price_compact(stats["price_median"]),
+                help=_format_price(stats["price_median"]),
+            )
+            high_col.metric(
+                f"Tinggi ({range_label.split('/')[1]})",
+                _format_price_compact(stats["price_high"]),
+                help=_format_price(stats["price_high"]),
+            )
         else:
             st.caption("Rentang harga belum tersedia tanpa pembanding tervalidasi.")
         st.caption(f"Rentang dihitung dari {stats['count']} listing nyata yang lolos pembersihan.")
@@ -330,14 +390,16 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
         st.info("Saran nominal belum tersedia karena tidak ada median pembanding nyata.")
     else:
         opening, target, maximum = st.columns(3)
-        opening.metric("Tawar awal (estimasi)", _format_price(nego.awal))
-        target.metric("Target realistis (estimasi)", _format_price(nego.realistis))
-        maximum.metric("Batas maksimal (estimasi)", _format_price(nego.batas))
+        opening.metric("Tawar awal (estimasi)", _format_price_compact(nego.awal), help=_format_price(nego.awal))
+        target.metric("Target realistis (estimasi)", _format_price_compact(nego.realistis), help=_format_price(nego.realistis))
+        maximum.metric("Batas maksimal (estimasi)", _format_price_compact(nego.batas), help=_format_price(nego.batas))
         st.caption("Estimasi dari harga listing pembanding dikoreksi 3-10%. Bukan harga transaksi terverifikasi.")
 
     st.subheader("Posisi di pasar")
     n_count = stats["count"]
-    if n_count < SOLID_COMPARABLES and n_count >= 1:
+    if n_count == 0:
+        st.info("Posisi pasar belum dapat ditentukan karena belum ada pembanding yang valid.")
+    elif n_count < SOLID_COMPARABLES and n_count >= 1:
         # Teks deskriptif untuk data sedikit, bukan persentil
         prices = sorted([item.price for item in result.comparables if item.price > 0])
         below = sum(1 for p in prices if listing_price > p)
@@ -347,16 +409,26 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
             st.write(f"Harga listing **lebih rendah dari semua {n_count} pembanding**.")
         else:
             st.write(f"Harga listing **lebih tinggi dari {below} dan lebih rendah dari {n_count - below}** dari {n_count} pembanding.")
+        _render_market_chart(result, listing_price)
     elif stats.get("listing_percentile") is not None:
         st.write(f"Harga listing berada pada **persentil ke-{stats['listing_percentile']:.0f}** dari {n_count} pembanding.")
-    _render_market_chart(result, listing_price)
+        _render_market_chart(result, listing_price)
 
     st.subheader("Tabel pembanding")
     _render_comparables(result, user_input["listing_price"])
 
+    # Saran tindakan saat 0 pembanding
+    if n_count == 0 and getattr(result, "manual_search_urls", None):
+        st.markdown("#### 🔍 Buka Pencarian Manual di Marketplace (Filter Terisi)")
+        st.write("Belum ada pembanding valid yang lolos filter otomatis. Anda dapat membuka pencarian manual di marketplace berikut dengan filter yang sudah terpasang:")
+        cols = st.columns(3)
+        for idx, (m_name, m_url) in enumerate(result.manual_search_urls.items()):
+            cols[idx % 3].link_button(f"Buka {m_name}", m_url, use_container_width=True)
+        st.info("💡 **Tips Pelonggaran**: Coba kosongkan nama varian saat screening, atau pilih model kembar sekelas jika tersedia.")
+
     st.subheader("Analisis KM")
-    if stats["average_km_per_year"] is None:
-        st.info("Rata-rata KM/tahun tidak dapat dihitung dari field KM/tahun yang tersedia.")
+    if n_count == 0 or stats.get("average_km_per_year") is None:
+        st.info("Rata-rata KM/tahun pasar belum dapat dihitung karena belum ada pembanding yang valid.")
     else:
         current_year = datetime.now().year
         listing_km_per_year = user_input["kilometer"] / max(1, current_year - user_input["year"])
@@ -392,21 +464,48 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
     for note in result.final_analysis.catatan:
         st.write(f"- {note}")
 
-    with st.expander("Sumber grounding, kueri, dan data yang dibuang"):
+    with st.expander("Sumber grounding, katalog, dan data yang dibuang", expanded=False):
+        if getattr(result, "catalog_urls_opened", None):
+            st.markdown("**Halaman Katalog Marketplace yang Dibuka (URL Terfilter)**")
+            for cat in result.catalog_urls_opened:
+                status_icon = "✅" if cat.get("status") == "success" else "⚠️"
+                st.markdown(f"- {status_icon} **{cat.get('domain', '')}** (Hal. {cat.get('page', 1)}): [{cat.get('url', '')}]({cat.get('url', '')}) — *{cat.get('links_found', 0)} tautan detail*")
+
         st.markdown("**Kueri Google Search**")
-        for query in result.queries:
-            st.write(f"- {query}")
-        st.markdown("**URL sumber**")
+        if result.queries:
+            for query in result.queries:
+                st.write(f"- `{query}`")
+        else:
+            st.caption("Tidak ada kueri grounding (mode katalog langsung / cache).")
+
+        st.markdown("**URL Sumber Grounding / Detail**")
         if result.sources:
             for source in result.sources:
                 domain = urlsplit(source.url).netloc
-                st.markdown(f"- [{domain}]({source.url})")
+                st.markdown(f"- [{domain}]({source.url}) - `{source.url}`")
         else:
             st.caption("Metadata grounding tidak mengembalikan URL sumber.")
-        if result.rejected:
-            st.markdown("**Listing yang dibuang dan alasannya**")
-            for rejected in result.rejected:
-                st.write(f"- {rejected['reason']} ({rejected['source_url']})")
+
+        st.markdown("**Listing yang Dibuang per Alasan (Dikelompokkan)**")
+        if getattr(result, "rejected_by_reason", None):
+            for reason, urls in result.rejected_by_reason.items():
+                st.markdown(f"- ❌ **{reason}** ({len(urls)} URL)")
+                with st.expander(f"Daftar URL: {reason}", expanded=False):
+                    for u in urls:
+                        st.write(f"- `{u}`")
+        elif result.rejected:
+            grouped_rej: dict[str, list[str]] = {}
+            for rej in result.rejected:
+                r_text = rej.get("reason", "Tidak memenuhi kriteria validasi")
+                grouped_rej.setdefault(r_text, []).append(rej.get("source_url", "-"))
+            for reason, urls in grouped_rej.items():
+                st.markdown(f"- ❌ **{reason}** ({len(urls)} URL)")
+                with st.expander(f"Daftar URL: {reason}", expanded=False):
+                    for u in urls:
+                        st.write(f"- `{u}`")
+        else:
+            st.caption("Tidak ada data listing yang dibuang pada analisa ini.")
+
 
     usage = result.usage
     model_display = result.model_used or "Gemini"

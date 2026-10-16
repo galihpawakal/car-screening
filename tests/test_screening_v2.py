@@ -67,7 +67,7 @@ def _score(n_comparables, listing_price=200_000_000, price_median=200_000_000,
 # ── 1. Mode by comparable count: n=0, n=1, n=2, n=5 ─────────────────────────
 
 class TestComparableModes:
-    """n < 2 → not assessable; 2 ≤ n < 5 → indicative; n ≥ 5 → normal."""
+    """n < 3 → not assessable; 3 ≤ n < 5 → indicative; n ≥ 5 → normal."""
 
     def test_zero_comparables_not_assessable(self):
         result = _score(0)
@@ -85,12 +85,22 @@ class TestComparableModes:
         assert format_screening_result(result)["score_assessable"] is False
 
     def test_two_comparables_indicative(self):
+        """n=2 is now the indikatif threshold (MIN_COMPARABLES=2)."""
         result = _score(2)
         assert result.total_score >= 0
         assert result.is_indicative is True
         formatted = format_screening_result(result)
         assert formatted["is_indicative"] is True
         assert "indikatif" in formatted["total_score_display"].lower()
+
+    def test_three_comparables_normal(self):
+        """n=3 is now normal mode (SOLID_COMPARABLES=3)."""
+        result = _score(3)
+        assert result.total_score >= 0
+        assert result.is_indicative is False
+        formatted = format_screening_result(result)
+        assert formatted["is_indicative"] is False
+        assert "indikatif" not in formatted["total_score_display"].lower()
 
     def test_five_comparables_normal(self):
         result = _score(5)
@@ -104,7 +114,7 @@ class TestComparableModes:
 # ── 2. Statistics: min-max vs P25/P75 ────────────────────────────────────────
 
 class TestStatisticsRanges:
-    """n < 5 → min/max; n ≥ 5 → P25/P75."""
+    """n < 3 → min/max; n ≥ 3 → P25/P75."""
 
     @staticmethod
     def _make_listing(price, year=2022, km=50_000, url="https://ex.test/1"):
@@ -127,17 +137,21 @@ class TestStatisticsRanges:
         assert result["price_low"] == 100_000_000  # min
         assert result["price_high"] == 200_000_000  # max
 
-    def test_four_listings_uses_min_max(self):
+    def test_three_listings_uses_percentiles(self):
+        """n=3 now uses P25/P75 (SOLID_COMPARABLES=3)."""
+        import numpy as np
         listings = [
             self._make_listing(100, url="https://ex.test/1"),
             self._make_listing(200, url="https://ex.test/2"),
             self._make_listing(300, url="https://ex.test/3"),
-            self._make_listing(400, url="https://ex.test/4"),
         ]
-        result = calculate_statistics(listings, listing_price=250,
+        result = calculate_statistics(listings, listing_price=200,
                                       target_year=2022, current_year=2026)
-        assert result["price_low"] == 100
-        assert result["price_high"] == 400
+        prices = [100, 200, 300]
+        expected_low = int(round(np.percentile(prices, 25)))
+        expected_high = int(round(np.percentile(prices, 75)))
+        assert result["price_low"] == expected_low
+        assert result["price_high"] == expected_high
 
     def test_five_listings_uses_percentiles(self):
         import numpy as np
@@ -292,7 +306,7 @@ class TestUnassessedComponentExclusion:
 # ── 6. Indicative mode cap at 70 ─────────────────────────────────────────────
 
 class TestIndicativeScoreCap:
-    """n < 5 → score capped at INDICATIVE_MAX_SCORE = 70."""
+    """n < 3 → score capped at INDICATIVE_MAX_SCORE = 70."""
 
     def test_indicative_mode_caps_score_at_70(self):
         # Perfect inputs: listing=median, all fields filled, no flags
@@ -307,7 +321,7 @@ class TestIndicativeScoreCap:
         assert result.total_score > INDICATIVE_MAX_SCORE
 
     def test_indicative_badge_in_formatted(self):
-        result = _score(3)
+        result = _score(2)
         formatted = format_screening_result(result)
         assert formatted["is_indicative"] is True
         assert "indikatif" in formatted["total_score_display"].lower()
@@ -463,16 +477,16 @@ class TestInfoCompleteness:
 # ── 14. Market confidence ────────────────────────────────────────────────────
 
 class TestMarketConfidence:
-    def test_below_five_is_low(self):
-        conf = get_market_confidence(3, 0.01, 100)
+    def test_below_solid_is_low(self):
+        conf = get_market_confidence(2, 0.01, 100)
         assert conf["level"] == "Rendah"
 
-    def test_ten_tight_spread_high(self):
-        conf = get_market_confidence(10, 0.10, 90)
+    def test_six_tight_spread_high(self):
+        conf = get_market_confidence(6, 0.10, 90)
         assert conf["level"] == "Tinggi"
 
-    def test_five_moderate_spread_sedang(self):
-        conf = get_market_confidence(5, 0.30, 70)
+    def test_three_moderate_spread_sedang(self):
+        conf = get_market_confidence(3, 0.30, 70)
         assert conf["level"] == "Sedang"
 
 
@@ -503,6 +517,13 @@ class TestFullScreeningIntegration:
         assert result.total_score <= 70
         assert result.total_score > 0
         assert "indikatif" in result.price_label.lower()
+
+    def test_n3_normal_all_wajar(self):
+        """n=3, listing=median -> normal mode, possibly layak."""
+        result = _score(3, listing_price=200_000_000, price_median=200_000_000)
+        assert not result.is_indicative
+        assert result.total_score > 70
+        assert result.category == "layak"
 
     def test_n5_normal_all_wajar(self):
         """n=5, listing=median -> normal mode, possibly layak."""

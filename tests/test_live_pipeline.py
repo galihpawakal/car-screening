@@ -307,10 +307,10 @@ class TestCleaningAndStatistics:
             current_year=2026,
         )
         assert result["count"] == 4
-        # n=4 < SOLID_COMPARABLES (5) -> min/max instead of P25/P75
-        assert result["price_low"] == 100
+        # n=4 >= SOLID_COMPARABLES (3) -> P25/P75
+        assert result["price_low"] == 175
         assert result["price_median"] == 250
-        assert result["price_high"] == 400
+        assert result["price_high"] == 325
         assert result["listing_percentile"] == 50
         assert result["average_km_per_year"] == pytest.approx((10_000 + 10_000 + 10_000 + 10_000) / 4)
 
@@ -481,9 +481,9 @@ class TestScoringFromLiveFacts:
     def test_fewer_than_five_is_explicitly_low_confidence_rule(self):
         from src.scoring import get_market_confidence
 
-        confidence = get_market_confidence(count=4, price_spread_ratio=0.01, completeness_pct=100)
+        confidence = get_market_confidence(count=2, price_spread_ratio=0.01, completeness_pct=100)
         assert confidence["level"] == "Rendah"
-        assert "Data pembanding kurang dari 5" in confidence["reason"]
+        assert "Data pembanding kurang dari 3" in confidence["reason"]
 
 
 class TestFourStagePipeline:
@@ -574,8 +574,8 @@ class TestFourStagePipeline:
             current_year=2026,
         )
         assert first.statistics["count"] == 4
-        assert first.warning and "sangat sedikit" in first.warning
-        assert first.confidence["level"] == "Rendah"
+        assert first.warning is None
+        assert first.confidence["level"] == "Sedang"
         assert first.description_skipped is True
         assert '"deskripsi"' not in provider.final_prompt
         assert first.final_analysis.saran_nego == calculate_negotiation_prices(first.statistics["price_median"])
@@ -597,7 +597,7 @@ class TestFourStagePipeline:
             current_year=2026,
         )
         assert second.cache_hit is True
-        assert provider.search_calls == 1
+        assert provider.search_calls == first.usage["grounding_calls"]
         assert second.statistics["listing_percentile"] == 100
         assert second.usage["grounding_calls"] == 0
 
@@ -762,7 +762,10 @@ class TestGeminiResilienceAndFallback:
                 self.search_calls += 1
                 return GroundedSearchResult(
                     text="listing facts",
-                    sources=[GroundingSource("https://cars.test/1", "Source 1")],
+                    sources=[
+                        GroundingSource("https://www.mobil123.com/dijual/toyota-yaris/1", "Source 1"),
+                        GroundingSource("https://www.mobil123.com/dijual/toyota-yaris/2", "Source 2"),
+                    ],
                     queries=["Toyota Yaris 2022"],
                     usage=TokenUsage(10, 20),
                     model="gemini-2.5-flash",
@@ -775,6 +778,9 @@ class TestGeminiResilienceAndFallback:
             def generate_structured(self, prompt, response_model):
                 if response_model in (ListingExtraction, ListingPageExtraction):
                     self.extract_calls += 1
+                    is_second = "toyota-yaris/2" in prompt
+                    target_url = "https://www.mobil123.com/dijual/toyota-yaris/2" if is_second else "https://www.mobil123.com/dijual/toyota-yaris/1"
+                    target_price = "Rp 245.000.000" if is_second else "Rp 240.000.000"
                     return StructuredResponse(
                         ListingPageExtraction(listings=[
                             extracted(
@@ -785,8 +791,8 @@ class TestGeminiResilienceAndFallback:
                                 kilometer="35.000 km",
                                 transmission="AT",
                                 location="Jakarta Barat",
-                                price="Rp 240.000.000",
-                                source_url="https://cars.test/1",
+                                price=target_price,
+                                source_url=target_url,
                             )
                         ]).model_dump_json(),
                         TokenUsage(15, 25),
@@ -830,9 +836,9 @@ class TestGeminiResilienceAndFallback:
             current_year=2026,
         )
         assert res1.cache_hit is False
-        assert res1.usage["grounding_calls"] == 1
+        assert res1.usage["grounding_calls"] >= 1
         assert res1.model_used == "gemini-2.5-flash"
-        assert provider.search_calls == 1
+        assert provider.search_calls == res1.usage["grounding_calls"]
 
         # Second run with same specs (cache hit)
         res2 = run_screening(
@@ -844,7 +850,7 @@ class TestGeminiResilienceAndFallback:
         )
         assert res2.cache_hit is True
         assert res2.usage["grounding_calls"] == 0
-        assert provider.search_calls == 1
+        assert provider.search_calls == res1.usage["grounding_calls"]
         assert res2.model_used == "gemini-2.5-flash"
 
 

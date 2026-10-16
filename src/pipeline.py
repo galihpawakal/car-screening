@@ -23,12 +23,26 @@ from src.config import (
 )
 from src.extract import (
     UNKNOWN,
+    ComparableListing,
     ExtractedListing,
     ListingExtraction,
     _parse_listings_leniently,
     extract_json_payload,
 )
-from src.page_reader import extract_listing_from_page
+from src.marketplace_config import (
+    MARKETPLACE_CATALOG_CONFIGS,
+    build_catalog_url,
+    build_manual_search_urls,
+    get_twin_models,
+)
+from src.marketplace_fetcher import (
+    CrawlFunnelMetrics,
+    crawl_marketplace_catalog,
+    fetch_and_parse_details_concurrent,
+)
+from src.tiered_screening import TierEvaluationResult, evaluate_tiered_comparables
+from src.page_reader import extract_listing_from_page, fetch_page_html
+from src.url_classifier import classify_url, extract_detail_links_from_html
 from src.rules import run_all_rules
 from src.scoring import (
     calculate_screening_score,
@@ -68,6 +82,13 @@ class ScreeningPipelineResult:
     model_used: str | None = None
     completion_status: str = "selesai"
     analysis_id: str | None = None
+    active_tier: int = 1
+    tier_label: str = ""
+    funnel_metrics: dict | None = None
+    catalog_urls_opened: list[dict] | None = None
+    rejected_by_reason: dict[str, list[str]] | None = None
+    manual_search_urls: dict[str, str] | None = None
+
 
 
 class PipelineError(RuntimeError):
@@ -76,7 +97,11 @@ class PipelineError(RuntimeError):
         self.stage = stage
 
 
-def build_marketplace_search_prompt(user_input: dict, marketplace_domain: str | list[str] = "") -> str:
+MAX_DETAIL_PER_LISTING = 5
+MAX_TOTAL_DETAIL_FETCH = 5
+
+
+def build_multi_round_search_prompt(user_input: dict, round_num: int, domains: list[str]) -> tuple[str, str]:
     brand = user_input["brand"]
     model = user_input["model"]
     variant = user_input.get("variant") or ""
@@ -84,19 +109,21 @@ def build_marketplace_search_prompt(user_input: dict, marketplace_domain: str | 
     trans = user_input["transmission"]
     loc = user_input["location"]
 
-    if isinstance(marketplace_domain, list):
-        domains = marketplace_domain
-    elif marketplace_domain:
-        domains = [marketplace_domain]
-    else:
-        domains = MARKETPLACE_DOMAINS
-
     domain_list = ", ".join(domains)
     site_queries = " OR ".join(f"site:{d}" for d in domains)
-    query = f"({site_queries}) {brand} {model} {variant} {year} {trans} bekas {loc}"
-    total_listings = min(MAX_LISTINGS_PER_MARKETPLACE_SEARCH * len(domains), 15)
 
-    return f"""Cari maksimal {total_listings} listing mobil bekas nyata dari marketplace ({domain_list}) yang paling mirip unit berikut.
+    if round_num == 1:
+        # Round 1: Kueri spesifik sesuai input lengkap
+        query = f"({site_queries}) {brand} {model} {variant} {year} {trans} bekas {loc}".strip()
+    elif round_num == 2:
+        # Round 2: Kueri tanpa varian atau cakupan Jabodetabek lebih luas
+        query = f"({site_queries}) {brand} {model} {year} {trans} bekas Jabodetabek Jakarta".strip()
+    else:
+        # Round 3: Kueri kota penyangga sekitar (Tangerang, Bekasi, Depok, Bogor)
+        query = f"({site_queries}) {brand} {model} {year} bekas Tangerang OR Bekasi OR Depok OR Bogor".strip()
+
+    total_listings = min(MAX_LISTINGS_PER_MARKETPLACE_SEARCH * len(domains), 6)
+    prompt = f"""Cari maksimal {total_listings} listing mobil bekas nyata dari marketplace ({domain_list}) untuk unit berikut.
 Pencarian Google Search: "{query}"
 Unit acuan: merek={brand}, model={model}, varian={variant}, tahun={year}, transmisi={trans}, lokasi={loc}.
 
@@ -121,6 +148,105 @@ PENTING: Tuliskan setiap listing yang ditemukan dari pencarian web nyata dalam f
 ```
 Sertakan juga rincian teks bernomor untuk setiap listing beserta URL/tautan spesifik dari marketplace ({domain_list}).
 Dilarang menggunakan data tiruan (dummy). Hanya gunakan data nyata dari pencarian web."""
+    return prompt, query
+
+
+def build_marketplace_search_prompt(user_input: dict, marketplace_domain: str | list[str] = "") -> str:
+    if isinstance(marketplace_domain, list):
+        domains = marketplace_domain
+    elif marketplace_domain:
+        domains = [marketplace_domain]
+    else:
+        domains = MARKETPLACE_DOMAINS
+    prompt, _ = build_multi_round_search_prompt(user_input, 1, domains)
+    return prompt
+
+
+def fetch_and_parse_listings_from_urls(
+    provider: SearchProvider,
+    sources: list[GroundingSource],
+    user_input: dict,
+    already_fetched_urls: set[str],
+    *,
+    max_total_fetch: int = MAX_TOTAL_DETAIL_FETCH,
+    notify: Callable[[str], None] = lambda _: None,
+) -> tuple[list[ExtractedListing], list[dict]]:
+    """Process grounding URLs: classify, extract detail links from listing pages, and fetch detail pages."""
+    extracted: list[ExtractedListing] = []
+    rejected: list[dict] = []
+    detail_queue: list[str] = []
+
+    for src in sources:
+        url = src.url
+        ctype = classify_url(url)
+        if ctype == "detail":
+            if url not in already_fetched_urls and url not in detail_queue:
+                detail_queue.append(url)
+        elif ctype == "listing":
+            domain = urlsplit(url).netloc
+            notify(f"📄 Halaman daftar terdeteksi ({domain}): mencari tautan unit detail...")
+            try:
+                html = fetch_page_html(url, timeout=6.0, retries=2, delay=0.2)
+                links = extract_detail_links_from_html(
+                    url,
+                    html,
+                    expected_model=user_input["model"],
+                    max_links=MAX_DETAIL_PER_LISTING,
+                )
+                if links:
+                    notify(f"🔗 Menemukan {len(links)} tautan unit detail dari {domain}.")
+                    for link in links:
+                        if link not in already_fetched_urls and link not in detail_queue:
+                            detail_queue.append(link)
+                    rejected.append({
+                        "source_url": url,
+                        "reason": f"Halaman daftar ({domain}): diekstrak {len(links)} tautan detail (angka daftar tidak dipakai langsung)",
+                    })
+                else:
+                    rejected.append({
+                        "source_url": url,
+                        "reason": f"Halaman daftar ({domain}): tidak ditemukan tautan unit detail yang cocok",
+                    })
+            except Exception as err:
+                rejected.append({
+                    "source_url": url,
+                    "reason": f"Halaman daftar ({domain}) tidak dapat diakses ({err})",
+                })
+        else:
+            rejected.append({
+                "source_url": url,
+                "reason": "URL bukan halaman detail atau daftar marketplace yang didukung",
+            })
+
+    # Fetch detail pages one by one
+    for detail_url in detail_queue:
+        if len(already_fetched_urls) >= max_total_fetch:
+            break
+        already_fetched_urls.add(detail_url)
+        domain = urlsplit(detail_url).netloc
+        notify(f"🔍 Membaca halaman detail ({len(already_fetched_urls)}/{max_total_fetch}): {domain}...")
+        try:
+            outcome = extract_listing_from_page(
+                provider,
+                detail_url,
+                expected_brand=user_input["brand"],
+                expected_model=user_input["model"],
+            )
+            if outcome.listing:
+                extracted.append(outcome.listing)
+                notify(f"✅ Listing detail berhasil diekstrak ({domain}): Rp {int(outcome.listing.price):,}")
+            else:
+                rejected.append({
+                    "source_url": detail_url,
+                    "reason": outcome.reason or "Gagal membaca fakta listing dari halaman detail",
+                })
+        except Exception as err:
+            rejected.append({
+                "source_url": detail_url,
+                "reason": f"Gagal membaca halaman detail ({err})",
+            })
+
+    return extracted, rejected
 
 
 def parse_manual_listing_urls(raw: str | list[str] | None) -> list[str]:
@@ -173,11 +299,17 @@ def _fallback_analysis(user_input: dict, statistics: dict, rule_flags: list) -> 
     listing_price = int(user_input.get("listing_price") or 0)
     price_diff_pct = (listing_price - price_median) / price_median if price_median > 0 else 0
 
-    if count < MIN_COMPARABLES:
+    if count == 0:
+        conclusion = (
+            "Belum ada pembanding valid yang berhasil dibaca dari web. "
+            "Skor angka tidak dihitung; gunakan tautan pencarian manual di marketplace atau verifikasi harga transaksi langsung."
+        )
+    elif count < MIN_COMPARABLES:
         conclusion = (
             f"Hanya {count} pembanding valid yang berhasil dibaca dari web. "
             "Skor angka tidak dihitung; verifikasi harga dan kondisi langsung sebelum membeli."
         )
+
     elif count < SOLID_COMPARABLES:
         conclusion = (
             f"Hanya ada {count} pembanding nyata yang lolos (data sangat sedikit). "
@@ -410,6 +542,24 @@ def run_marketplace_grounded_search(
     return result
 
 
+def get_default_direct_marketplace_urls(brand: str, model: str, transmission: str = "") -> list[str]:
+    """Generate direct marketplace catalog URLs for the specified brand and model."""
+    brand_slug = brand.strip().lower().replace(" ", "-")
+    model_slug = model.strip().lower().replace(" ", "-")
+
+    trans_param = ""
+    trans_upper = transmission.strip().upper()
+    if trans_upper in ("AT", "AUTOMATIC", "OTOMATIS"):
+        trans_param = "?transmission=automatic"
+    elif trans_upper in ("MT", "MANUAL"):
+        trans_param = "?transmission=manual"
+
+    return [
+        f"https://www.carsome.id/beli-mobil-bekas/{brand_slug}/{model_slug}{trans_param}",
+        f"https://www.carmudi.co.id/mobil-dijual/{brand_slug}/{model_slug}/indonesia{trans_param}",
+    ]
+
+
 def run_screening(
     *,
     provider: SearchProvider,
@@ -438,97 +588,271 @@ def run_screening(
         notify("Memeriksa cache analisa lokal SQLite...")
         payload = cache.get(cache_key)
         if payload is not None:
+            cached_listings = payload.get("listings") or []
+            if len(cached_listings) < MIN_COMPARABLES:
+                payload = None
+        if payload is not None:
             cache_hit = True
             stage(38, "Memuat hasil pencarian tersimpan (cache 24 jam)...")
             comparables, rejected, sources, queries, fetched_at = _restore_cache(payload)
             used_model = payload.get("model_used") or used_model or "Cache"
+            active_tier = payload.get("active_tier", 1)
+            tier_label = payload.get("tier_label", "Cache (tersimpan)")
+            funnel_metrics = payload.get("funnel_metrics")
+            catalog_urls_opened = payload.get("catalog_urls_opened", [])
+            rejected_by_reason = payload.get("rejected_by_reason", {})
+            manual_search_urls = payload.get("manual_search_urls") or build_manual_search_urls(
+                brand=user_input["brand"],
+                model=user_input["model"],
+                year=int(user_input["year"]),
+                transmission=user_input.get("transmission", ""),
+            )
             notify(f"Data ditemukan di cache: memuat {len(comparables)} pembanding tersimpan.")
         else:
-            grounded: GroundedSearchResult
+            all_extracted: list[ExtractedListing] = []
+            all_rejected: list[dict] = []
+            all_sources: list[GroundingSource] = []
+            all_queries: list[str] = []
+            already_fetched_urls: set[str] = set()
+            max_rounds = 1
+
+            search_mode = user_input.get("search_mode", "grounding")
+            funnel = CrawlFunnelMetrics()
+            manual_search_urls = build_manual_search_urls(
+                brand=user_input["brand"],
+                model=user_input["model"],
+                year=int(user_input["year"]),
+                transmission=user_input.get("transmission", ""),
+            )
+
+            def _crawl_all_marketplaces() -> tuple[list[ExtractedListing], list[dict[str, str]]]:
+                nonlocal used_model
+                domains = ["carmudi.co.id", "carsome.id", "oto.com", "olx.co.id", "mobil123.com", "mobilbekas.com"]
+                collected_links: list[str] = []
+                for d in domains:
+                    cfg = MARKETPLACE_CATALOG_CONFIGS.get(d)
+                    mp = cfg.max_pages if cfg else 3
+                    links = crawl_marketplace_catalog(
+                        d,
+                        brand=user_input["brand"],
+                        model=user_input["model"],
+                        year=int(user_input["year"]),
+                        transmission=user_input.get("transmission", ""),
+                        max_pages=mp,
+                        target_candidates=30,
+                        notify=notify,
+                        funnel=funnel,
+                    )
+                    collected_links.extend(links)
+                    for lk in links:
+                        all_sources.append(GroundingSource(url=lk, title=d))
+
+                # If collected links are few (< 8), check twin models
+                twin_models = get_twin_models(user_input["model"])
+                if len(collected_links) < 8 and twin_models:
+                    notify(f"⚡ Kandidat langsung sedikit ({len(collected_links)}), menelusuri katalog model kembar ({', '.join(twin_models)})...")
+                    for twin in twin_models:
+                        for d in ["carmudi.co.id", "carsome.id"]:
+                            twin_links = crawl_marketplace_catalog(
+                                d,
+                                brand="",
+                                model=twin,
+                                year=int(user_input["year"]),
+                                transmission=user_input.get("transmission", ""),
+                                max_pages=3,
+                                target_candidates=15,
+                                notify=notify,
+                                funnel=funnel,
+                            )
+                            collected_links.extend(twin_links)
+                            for lk in twin_links:
+                                all_sources.append(GroundingSource(url=lk, title=d))
+
+                # Fetch details concurrently (max 4 workers, max 40 detail fetch)
+                details, rej = fetch_and_parse_details_concurrent(
+                    collected_links,
+                    expected_brand=user_input["brand"],
+                    expected_model=user_input["model"],
+                    expected_year=int(user_input["year"]),
+                    max_workers=4,
+                    max_total_fetch=40,
+                    notify=notify,
+                    funnel=funnel,
+                )
+                if not used_model:
+                    used_model = "Pencarian Langsung Marketplace"
+                return details, rej
+
             if manual_urls:
                 stage(10, "Mode URL manual: melewati pencarian, langsung membaca halaman...")
                 notify(f"Memakai {len(manual_urls)} URL listing pembanding yang ditempel pengguna.")
-                sources = [GroundingSource(url=url, title=urlsplit(url).netloc) for url in manual_urls]
-                grounded = GroundedSearchResult(
-                    text="",
-                    sources=sources,
-                    queries=[],
-                    usage=TokenUsage(),
-                    grounding_calls=0,
+                manual_sources = [GroundingSource(url=url, title=urlsplit(url).netloc) for url in manual_urls]
+                all_sources.extend(manual_sources)
+                extracted, round_rejected = fetch_and_parse_listings_from_urls(
+                    provider,
+                    manual_sources,
+                    user_input,
+                    already_fetched_urls,
+                    max_total_fetch=MAX_MANUAL_LISTING_URLS,
+                    notify=notify,
                 )
+                all_extracted.extend(extracted)
+                all_rejected.extend(round_rejected)
+            elif search_mode == "direct":
+                stage(10, "Tahap 1/4: mencari listing terfilter langsung dari katalog marketplace...")
+                notify("🔍 Menjalankan pencarian langsung katalog marketplace dengan filter tahun & transmisi...")
+                dir_extracted, dir_rejected = _crawl_all_marketplaces()
+                all_extracted.extend(dir_extracted)
+                all_rejected.extend(dir_rejected)
+                used_model = "Pencarian Langsung Marketplace"
+                notify(f"Pencarian langsung selesai: {len(dir_extracted)} listing detail berhasil dibaca.")
             else:
-                stage(10, "Tahap 1/4: mencari listing per marketplace (Google Search)...")
-                notify(
-                    f"Mencari listing nyata di {len(MARKETPLACE_DOMAINS)} marketplace untuk "
-                    f"{user_input['brand']} {user_input['model']} {user_input['year']}..."
-                )
-                calls_before_search = getattr(provider, "api_calls", 0)
-                try:
-                    grounded = run_marketplace_grounded_search(provider, user_input, notify=notify)
-                except Exception as error:
-                    grounding_calls += max(0, getattr(provider, "api_calls", calls_before_search) - calls_before_search)
-                    raise PipelineError("Pencarian", f"Pencarian Gemini gagal setelah retry: {error}") from error
-                token_input += grounded.usage.input_tokens
-                token_output += grounded.usage.output_tokens
-                grounding_calls += grounded.grounding_calls
-                used_model = grounded.model or getattr(provider, "last_used_model", getattr(provider, "model", ""))
-                sources = grounded.sources
-                notify(
-                    f"Pencarian selesai: {len(sources)} URL ter-resolve dari grounding "
-                    f"(google.com ditolak)."
-                )
+                for round_num in range(1, max_rounds + 1):
+                    progress_pct = 10 + (round_num - 1) * 15
+                    stage(progress_pct, f"Tahap 1/4: mencari listing di marketplace (Google Search putaran {round_num}/{max_rounds})...")
+                    prompt, query = build_multi_round_search_prompt(user_input, round_num, MARKETPLACE_DOMAINS)
+                    all_queries.append(query)
+                    notify(f"🔍 Putaran {round_num}/{max_rounds}: Google Search: '{query}'...")
 
-            listing_urls = _collect_listing_urls(grounded, manual_urls)
-            stage(30, "Tahap 2/4: mengekstrak fakta listing pembanding...")
-            notify("Mengekstrak fakta listing dari hasil pencarian grounding...")
-            extraction, page_rejected = parse_grounded_listings(grounded, user_input)
-            page_usage = TokenUsage()
+                    calls_before_search = getattr(provider, "api_calls", 0)
+                    try:
+                        grounded = provider.search(prompt, marketplace=",".join(MARKETPLACE_DOMAINS))
+                    except Exception as error:
+                        grounding_calls += max(0, getattr(provider, "api_calls", calls_before_search) - calls_before_search)
+                        err_str = str(error)
+                        if "tidak tersedia" in err_str or "kuota" in err_str.lower() or "quota" in err_str.lower() or "429" in err_str or "timeout" in err_str.lower():
+                            notify(f"⚠️ {error}. Beralih ke pencarian langsung marketplace...")
+                            break
+                        if round_num == 1:
+                            raise PipelineError("Pencarian", f"Pencarian Gemini gagal setelah retry: {error}") from error
+                        notify(f"⚠️ Pencarian putaran {round_num} gagal: {error}")
+                        break
 
-            if not extraction.listings and manual_urls:
-                notify(f"Membaca {len(manual_urls)} URL listing manual...")
-                try:
-                    extraction, page_rejected_urls, page_usage = _read_listings_from_urls(
-                        provider, manual_urls, notify=notify
+                    token_input += grounded.usage.input_tokens
+                    token_output += grounded.usage.output_tokens
+                    grounding_calls += grounded.grounding_calls
+                    used_model = grounded.model or getattr(provider, "last_used_model", getattr(provider, "model", ""))
+
+                    for s in grounded.sources:
+                        if not any(existing.url == s.url for existing in all_sources):
+                            all_sources.append(s)
+
+                    notify(f"Pencarian putaran {round_num} selesai: {len(grounded.sources)} URL ditemukan.")
+                    stage(progress_pct + 10, f"Tahap 2/4: membaca dan mengekstrak halaman detail (putaran {round_num})...")
+
+                    extracted, round_rejected = fetch_and_parse_listings_from_urls(
+                        provider,
+                        grounded.sources,
+                        user_input,
+                        already_fetched_urls,
+                        max_total_fetch=MAX_TOTAL_DETAIL_FETCH,
+                        notify=notify,
                     )
-                    page_rejected.extend(page_rejected_urls)
-                    token_input += page_usage.input_tokens
-                    token_output += page_usage.output_tokens
-                except Exception as error:
-                    notify(f"Pembacaan URL manual dilewati: {error}")
-            elif not extraction.listings and listing_urls:
-                notify("Mencoba ekstraksi langsung dari URL sumber...")
-                try:
-                    extraction, page_rejected_urls, page_usage = _read_listings_from_urls(
-                        provider, listing_urls[:3], notify=notify
-                    )
-                    page_rejected.extend(page_rejected_urls)
-                    token_input += page_usage.input_tokens
-                    token_output += page_usage.output_tokens
-                except Exception as error:
-                    notify(f"Pembacaan URL sumber dilewati: {error}")
+                    all_extracted.extend(extracted)
+                    all_rejected.extend(round_rejected)
 
-            notify(f"Ekstraksi selesai: {len(extraction.listings)} listing berhasil ter-ekstrak.")
+                # Fallback to direct marketplace catalog if grounding found insufficient listings
+                if len(all_extracted) < 3:
+                    notify("🔄 Kuota/hasil Google Search terbatas. Menjalankan pencarian langsung katalog marketplace sebagai cadangan...")
+                    dir_extracted, dir_rejected = _crawl_all_marketplaces()
+                    all_extracted.extend(dir_extracted)
+                    all_rejected.extend(dir_rejected)
+                    if not used_model or used_model == "Cache":
+                        used_model = "Pencarian Langsung Marketplace"
 
-            stage(48, "Tahap 3/4: membersihkan listing dan menghitung statistik...")
-            notify("Memvalidasi merek, model, transmisi, URL unik, dan batas harga...")
-            grounded_url_set = {source.url for source in sources} | set(manual_urls)
+            stage(48, "Tahap 3/4: memvalidasi listing dengan tiered fallback (Tier 1-4)...")
+            notify("Memvalidasi listing dan mengelompokkan ke dalam tingkatan (Tier 1-4)...")
             try:
-                cleaned: CleanResult = clean_listings(
-                    extraction,
+                tier_result: TierEvaluationResult = evaluate_tiered_comparables(
+                    all_extracted,
                     expected_brand=user_input["brand"],
                     expected_model=user_input["model"],
+                    expected_year=int(user_input["year"]),
                     expected_transmission=user_input["transmission"],
+                    expected_variant=user_input.get("variant") or "",
+                    require_jabodetabek=True,
                     current_year=current_year,
-                    grounded_urls=grounded_url_set,
+                    target_count=5,
                 )
             except Exception as error:
-                raise PipelineError("Pembersihan", f"Data listing tidak dapat dibersihkan: {error}") from error
-            comparables = cleaned.listings
-            rejected = [asdict(item) for item in cleaned.rejected]
-            for item in page_rejected:
-                rejected.append(asdict(item))
-            queries = grounded.queries
-            notify(f"Pembersihan selesai: {len(comparables)} lolos validasi, {len(rejected)} ditolak.")
+                raise PipelineError("Pembersihan", f"Data listing tidak dapat divalidasi: {error}") from error
+
+            comparables = tier_result.listings
+            active_tier = tier_result.active_tier
+            tier_label = tier_result.tier_label
+            rejected_by_reason = tier_result.rejected_reasons
+
+            # Backup from SQLite market listings database if live comparables < 5
+            if len(comparables) < 5:
+                try:
+                    db_backups = cache.get_recent_backup_listings(
+                        model=user_input["model"],
+                        transmission=user_input["transmission"],
+                        year=int(user_input["year"]),
+                        twin_models=get_twin_models(user_input["model"]),
+                        max_age_days=14,
+                        limit=5 - len(comparables),
+                    )
+                    live_urls = {c.source_url for c in comparables}
+                    added_backups = 0
+                    for row in db_backups:
+                        if row["source_url"] in live_urls:
+                            continue
+                        live_urls.add(row["source_url"])
+                        is_twin = row["model"].lower() != user_input["model"].lower()
+                        comparables.append(ComparableListing(
+                            brand=row["brand"],
+                            model=row["model"],
+                            variant=row["variant"],
+                            year=row["year"],
+                            kilometer=row["kilometer"] or 50000,
+                            transmission=user_input["transmission"],
+                            location=row["location"] or "Jabodetabek",
+                            seller_type=row["seller_type"] or "dealer",
+                            price=row["price"],
+                            source_url=row["source_url"],
+                            fetched_at=row["scraped_at"],
+                            is_km_estimated=False,
+                            is_same_variant=row["variant"].lower() == (user_input.get("variant") or "").lower(),
+                            page_type="detail",
+                            tier=4 if is_twin else 3,
+                            weight=0.5 if is_twin else 0.8,
+                            is_twin_model=is_twin,
+                            notes=f"Database Pasar ({row['scraped_at'][:10]})",
+                        ))
+                        added_backups += 1
+                    if added_backups > 0:
+                        notify(f"💾 Memuat {added_backups} pembanding cadangan dari Database Listing Pasar (≤ 14 hari).")
+                except Exception as db_err:
+                    logger.debug("Gagal memuat listing cadangan dari DB: %s", db_err)
+
+            # Save valid live comparables into market_listings table
+            if comparables:
+                try:
+                    cache.save_market_listings(comparables)
+                except Exception as save_err:
+                    logger.debug("Gagal menyimpan listing ke database pasar: %s", save_err)
+
+            # Aggregate all rejected items into rejected list
+            flat_rejected: list[dict] = list(all_rejected)
+            for reason, urls in rejected_by_reason.items():
+                for u in urls:
+                    flat_rejected.append({"source_url": u, "reason": reason})
+
+            rejected = flat_rejected
+            sources = all_sources
+            queries = all_queries
+            funnel_metrics = {
+                "catalog_urls_opened": len(funnel.catalog_urls_opened),
+                "detail_links_found": funnel.detail_links_found,
+                "detail_links_prefiltered_out": funnel.detail_links_prefiltered_out,
+                "detail_pages_fetched": funnel.detail_pages_fetched,
+                "detail_pages_parsed": funnel.detail_pages_parsed,
+                "valid_comparables": len(comparables),
+            }
+            catalog_urls_opened = funnel.catalog_urls_opened
+
+            notify(f"Validasi selesai: {len(comparables)} pembanding valid ({tier_label}), {len(rejected)} data ditolak.")
             payload = {
                 "listings": [item.model_dump(mode="json") for item in comparables],
                 "rejected": rejected,
@@ -543,8 +867,18 @@ def run_screening(
                 "queries": queries,
                 "fetched_at": fetched_at,
                 "model_used": used_model,
+                "active_tier": active_tier,
+                "tier_label": tier_label,
+                "funnel_metrics": funnel_metrics,
+                "catalog_urls_opened": catalog_urls_opened,
+                "rejected_by_reason": rejected_by_reason,
+                "manual_search_urls": manual_search_urls,
             }
-            cache.set(cache_key, payload)
+            if len(comparables) >= MIN_COMPARABLES:
+                cache.set(cache_key, payload)
+            else:
+                notify(f"⚠️ Hanya ada {len(comparables)} pembanding valid (< {MIN_COMPARABLES}); hasil tidak disimpan ke cache agar dapat dicari ulang.")
+
 
         stage(58, "Menghitung rentang, posisi pasar, dan KM/tahun...")
         notify("Menghitung P25, median, P75, dan deviasi kilometer per tahun...")
@@ -557,7 +891,8 @@ def run_screening(
                 current_year=current_year,
             )
             payload["statistics"] = statistics
-            cache.set(cache_key, payload)
+            if len(comparables) >= MIN_COMPARABLES:
+                cache.set(cache_key, payload)
         statistics = dict(statistics)
         statistics["listing_percentile"] = calculate_listing_percentile(
             comparables, int(user_input["listing_price"])
@@ -575,10 +910,11 @@ def run_screening(
                 "Rentang harga dan skor pasar berkeyakinan rendah."
             )
 
-        # Price banner warning for extremely cheap listings
+        # Price banner warning for extremely cheap listings (only if comparables >= 3)
         _price_banner = price_banner_warning(
             int(user_input["listing_price"]),
             statistics["price_median"] or 0,
+            n_comparables=n_count,
         )
         if _price_banner:
             if warning:
@@ -595,10 +931,11 @@ def run_screening(
             model=str(user_input["model"]),
             description=description or None,
             current_year=current_year,
+            n_comparables=n_count,
         )
         final_analysis = _fallback_analysis(user_input, statistics, rule_flags)
         ai_error = None
-        if n_count >= MIN_COMPARABLES:
+        if n_count >= SOLID_COMPARABLES:
             stage(70, "Tahap 4/4: membuat kesimpulan terstruktur tanpa Search...")
             notify("Menyusun analisa akhir, saran negosiasi, dan checklist inspeksi...")
             analysis_input = {key: value for key, value in user_input.items() if key not in ("deskripsi", "manual_listing_urls")}
@@ -613,6 +950,12 @@ def run_screening(
                 ai_error = (
                     f"Analisa akhir Gemini gagal setelah retry; hasil statistik dan aturan tetap tersedia: {error}"
                 )
+        elif n_count >= MIN_COMPARABLES:
+            # Mode indikatif: skip LLM call untuk hemat token, pakai fallback analysis
+            ai_error = (
+                f"Mode indikatif ({n_count} pembanding). Analisa akhir LLM dilewati untuk hemat token; "
+                "skor dihitung dari statistik dan aturan kode."
+            )
         else:
             ai_error = (
                 f"Kurang dari {MIN_COMPARABLES} listing valid setelah pembacaan halaman; analisa akhir LLM dilewati "
@@ -682,7 +1025,14 @@ def run_screening(
             description_skipped=not bool(description),
             model_used=used_model,
             completion_status=completion_status,
+            active_tier=active_tier,
+            tier_label=tier_label,
+            funnel_metrics=funnel_metrics,
+            catalog_urls_opened=catalog_urls_opened,
+            rejected_by_reason=rejected_by_reason,
+            manual_search_urls=manual_search_urls,
         )
+
 
         save_fn = getattr(cache, "save_screening_record", None)
         if callable(save_fn):

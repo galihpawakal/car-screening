@@ -111,7 +111,7 @@ class ListingExtraction(BaseModel):
 class ComparableListing(BaseModel):
     """Persistable listing facts only; never stores seller copy or images."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     brand: str = UNKNOWN
     model: str
@@ -124,6 +124,13 @@ class ComparableListing(BaseModel):
     price: int
     source_url: str
     fetched_at: str
+    is_km_estimated: bool = False
+    is_same_variant: bool = True
+    page_type: str = "detail"
+    tier: int = 1
+    weight: float = 1.0
+    is_twin_model: bool = False
+    notes: str = ""
 
 
 class ExtractionResponse(BaseModel):

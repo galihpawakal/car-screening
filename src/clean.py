@@ -69,12 +69,27 @@ def _known(value: str) -> str | None:
     return None if _unknown(value) else value.strip()
 
 
+JABODETABEK_KEYWORDS = [
+    "jakarta", "dki", "bogor", "depok", "tangerang", "tangsel", "bekasi"
+]
+
+
+def is_jabodetabek(location: str | None) -> bool:
+    if not location or _unknown(location):
+        return False
+    loc_lower = location.lower()
+    return any(keyword in loc_lower for keyword in JABODETABEK_KEYWORDS)
+
+
 def clean_listings(
     extracted: ListingExtraction | list[ExtractedListing],
     *,
     expected_brand: str,
     expected_model: str,
     expected_transmission: str,
+    expected_year: int | None = None,
+    expected_variant: str = "",
+    require_jabodetabek: bool = False,
     current_year: int | None = None,
     fetched_at: datetime | None = None,
     grounded_urls: set[str] | None = None,
@@ -104,7 +119,7 @@ def clean_listings(
         if price is None:
             reject(item, "Harga tidak tersedia")
             continue
-        if not 1_000_000 <= price <= 20_000_000_000:
+        if not 20_000_000 <= price <= 20_000_000_000:
             reject(item, "Harga di luar rentang masuk akal")
             continue
         if item.model.strip().casefold() != expected_model.strip().casefold():
@@ -113,23 +128,43 @@ def clean_listings(
         if not _unknown(item.brand) and item.brand.strip().casefold() != expected_brand.strip().casefold():
             reject(item, "Merek tidak cocok dengan input")
             continue
+
         year = _parse_integer(item.year)
         if year is not None and not 1980 <= year <= now:
             reject(item, "Tahun di luar rentang masuk akal")
             continue
+        if expected_year is not None:
+            if year is None:
+                reject(item, "Tahun tidak tersedia")
+                continue
+            if abs(year - expected_year) > 1:
+                reject(item, f"Tahun di luar rentang ±1 ({year} vs {expected_year})")
+                continue
+
         kilometer = _parse_integer(item.kilometer)
-        if kilometer is not None and not 0 < kilometer <= 1_500_000:
+        if kilometer is None:
+            reject(item, "Kilometer tidak tersedia")
+            continue
+        if not 0 < kilometer <= 1_500_000:
             reject(item, "KM di luar rentang masuk akal")
             continue
+
         transmission = _known(item.transmission)
-        if transmission and transmission.casefold() not in {"at", "mt", "automatic", "manual", "otomatis", "manual transmission"}:
+        if not transmission or transmission.casefold() not in {"at", "mt", "automatic", "manual", "otomatis", "manual transmission"}:
             reject(item, "Transmisi tidak dikenali")
             continue
-        if transmission and expected_transmission.casefold() in {"at", "mt"}:
+        if expected_transmission.casefold() in {"at", "mt"}:
             is_at = transmission.casefold() in {"at", "automatic", "otomatis"}
             if is_at != (expected_transmission.casefold() == "at"):
                 reject(item, "Transmisi tidak cocok dengan input")
                 continue
+
+        if require_jabodetabek:
+            if not is_jabodetabek(item.location):
+                loc_disp = _known(item.location) or "tidak diketahui"
+                reject(item, f"Lokasi di luar Jabodetabek ({loc_disp})")
+                continue
+
         if url in seen_urls:
             reject(item, "Duplikat URL")
             continue
@@ -141,17 +176,26 @@ def clean_listings(
         seen_urls.add(url)
         if fact_key:
             seen_facts.add(fact_key)
+
+        is_km_estimated = "estimasi" in (item.kilometer or "").lower()
+        is_same_variant = True
+        if expected_variant and not _unknown(item.variant):
+            is_same_variant = expected_variant.lower() in item.variant.lower()
+
         cleaned.append(ComparableListing(
             brand=_known(item.brand) or expected_brand,
             model=item.model.strip(),
             variant=_known(item.variant) or UNKNOWN,
             year=year,
             kilometer=kilometer,
-            transmission=transmission or UNKNOWN,
+            transmission="AT" if (transmission and transmission.casefold() in {"at", "automatic", "otomatis"}) else "MT",
             location=_known(item.location) or UNKNOWN,
             seller_type=_known(item.seller_type) or UNKNOWN,
             price=price,
             source_url=url,
             fetched_at=timestamp,
+            is_km_estimated=is_km_estimated,
+            is_same_variant=is_same_variant,
+            page_type="detail",
         ))
     return CleanResult(listings=cleaned, rejected=rejected)

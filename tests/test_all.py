@@ -65,10 +65,10 @@ def test_km_score_compares_against_observed_comparable_average():
     assert "rata-rata pembanding" in component.reason
 
 
-def test_market_confidence_is_low_below_five_comparables():
-    confidence = get_market_confidence(4, 0.01, 100)
+def test_market_confidence_is_low_below_solid_comparables():
+    confidence = get_market_confidence(2, 0.01, 100)
     assert confidence["level"] == "Rendah"
-    assert "kurang dari 5" in confidence["reason"]
+    assert "kurang dari 3" in confidence["reason"]
 
 
 def test_price_labels_are_based_on_market_median():

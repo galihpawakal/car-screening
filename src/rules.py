@@ -15,10 +15,10 @@ class RuleRedFlag:
 
 
 def check_price_below_estimate(
-    listing_price: int, price_median: int
+    listing_price: int, price_median: int, n_comparables: int = 10
 ) -> RuleRedFlag | None:
-    """Cek apakah harga listing >25% di bawah estimasi median."""
-    if price_median <= 0:
+    """Cek apakah harga listing >25% di bawah estimasi median (hanya jika pembanding >= 3)."""
+    if price_median <= 0 or n_comparables < 3:
         return None
     diff_pct = (listing_price - price_median) / price_median
     threshold = -RULE_THRESHOLDS["price_below_estimate_pct"]
@@ -111,12 +111,13 @@ def run_all_rules(
     model: str,
     description: str | None,
     current_year: int = 2024,
+    n_comparables: int = 10,
 ) -> list[RuleRedFlag]:
     """Jalankan semua aturan red flag dan kembalikan daftar flag."""
     flags = []
     
-    # Harga terlalu murah
-    flag = check_price_below_estimate(listing_price, price_median)
+    # Harga terlalu murah (hanya jika n_comparables >= 3)
+    flag = check_price_below_estimate(listing_price, price_median, n_comparables=n_comparables)
     if flag:
         flags.append(flag)
     

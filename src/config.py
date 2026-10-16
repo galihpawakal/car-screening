@@ -120,15 +120,15 @@ MARKETPLACE_DOMAINS: list[str] = [
 ]
 
 # --- Comparable thresholds ---
-# Minimum: n < MIN_COMPARABLES -> "Tidak dapat dinilai"
+# Minimum: n < MIN_COMPARABLES -> "Tidak dapat dinilai" (sangat rendah)
 MIN_COMPARABLES = 2
-# Solid: n >= SOLID_COMPARABLES -> mode normal; 2 <= n < 5 -> mode indikatif
-SOLID_COMPARABLES = 5
+# Solid: n >= SOLID_COMPARABLES -> mode normal; 2 <= n < 3 -> mode indikatif
+SOLID_COMPARABLES = 3
 # Backward-compat alias used by existing tests
 MIN_COMPARABLES_FOR_SCORE = MIN_COMPARABLES
 
 MAX_MANUAL_LISTING_URLS = 10
-MAX_LISTINGS_PER_MARKETPLACE_SEARCH = 5
+MAX_LISTINGS_PER_MARKETPLACE_SEARCH = 3
 
 # --- Scoring functions (di config agar mudah diubah) ---
 

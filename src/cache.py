@@ -329,3 +329,80 @@ class SQLiteAnalysisCache:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS total FROM market_listings").fetchone()
             return int(row["total"]) if row else 0
+
+    def save_market_listings(self, listings: list[Any], screening_id: str = "") -> None:
+        """Save a batch of valid comparable listings to market_listings database."""
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            for comp in listings:
+                source_url = getattr(comp, "source_url", None) or (comp.get("source_url") if isinstance(comp, dict) else "")
+                if not source_url:
+                    continue
+                listing_id = str(uuid.uuid5(uuid.NAMESPACE_URL, source_url))
+                domain = urlsplit(source_url).netloc
+                c_brand = getattr(comp, "brand", "") or (comp.get("brand") if isinstance(comp, dict) else "")
+                c_model = getattr(comp, "model", "") or (comp.get("model") if isinstance(comp, dict) else "")
+                c_variant = getattr(comp, "variant", "") or (comp.get("variant") if isinstance(comp, dict) else "")
+                c_year = getattr(comp, "year", None) or (comp.get("year") if isinstance(comp, dict) else None)
+                c_km = getattr(comp, "kilometer", None) or (comp.get("kilometer") if isinstance(comp, dict) else None)
+                c_trans = getattr(comp, "transmission", "") or (comp.get("transmission") if isinstance(comp, dict) else "")
+                c_loc = getattr(comp, "location", "") or (comp.get("location") if isinstance(comp, dict) else "")
+                c_price = getattr(comp, "price", 0) or (comp.get("price", 0) if isinstance(comp, dict) else 0)
+                c_seller = getattr(comp, "seller_type", "") or (comp.get("seller_type", "") if isinstance(comp, dict) else "")
+                c_scraped = getattr(comp, "fetched_at", "") or created_at
+
+                connection.execute(
+                    """INSERT INTO market_listings (
+                        id, screening_id, source_url, domain, brand, model, variant,
+                        year, kilometer, transmission, location, price, seller_type, scraped_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_url) DO UPDATE SET
+                        price = excluded.price,
+                        kilometer = COALESCE(excluded.kilometer, market_listings.kilometer),
+                        scraped_at = excluded.scraped_at
+                    """,
+                    (
+                        listing_id, screening_id, source_url, domain, str(c_brand),
+                        str(c_model), str(c_variant), c_year, c_km, str(c_trans),
+                        str(c_loc), int(c_price), str(c_seller), str(c_scraped),
+                    ),
+                )
+
+    def get_recent_backup_listings(
+        self,
+        *,
+        model: str,
+        transmission: str,
+        year: int,
+        twin_models: list[str] | None = None,
+        max_age_days: int = 14,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Query listings from market_listings aged <= 14 days matching model or twins, transmission, year +/- 1."""
+        from datetime import timedelta
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+        models_to_match = [model.lower()] + [t.lower() for t in (twin_models or [])]
+        placeholders = ",".join("?" for _ in models_to_match)
+
+        trans_upper = transmission.strip().upper()
+        if trans_upper in ("AT", "AUTOMATIC", "OTOMATIS"):
+            trans_clause = "AND (LOWER(transmission) LIKE '%at%' OR LOWER(transmission) LIKE '%auto%' OR LOWER(transmission) LIKE '%otomatis%')"
+        elif trans_upper in ("MT", "MANUAL"):
+            trans_clause = "AND (LOWER(transmission) LIKE '%mt%' OR LOWER(transmission) LIKE '%manual%')"
+        else:
+            trans_clause = ""
+
+        query = f"""
+            SELECT * FROM market_listings
+            WHERE LOWER(model) IN ({placeholders})
+              AND year BETWEEN ? AND ?
+              AND scraped_at >= ?
+              {trans_clause}
+            ORDER BY scraped_at DESC
+            LIMIT ?
+        """
+        params = list(models_to_match) + [year - 1, year + 1, cutoff_date, limit]
+        with self._connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
