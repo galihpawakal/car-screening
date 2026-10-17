@@ -783,14 +783,40 @@ def _render_database_tab(cache: SQLiteAnalysisCache) -> None:
 
 def render_app() -> None:
     cache = SQLiteAnalysisCache(CACHE_DB_PATH, ttl_seconds=86_400)
+
+    # CSS untuk menjamin scrollbar halaman aktif dan lancar saat menampilkan hasil screening
+    st.markdown(
+        """
+        <style>
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            overflow-y: auto !important;
+            height: auto !important;
+            min-height: 100vh !important;
+        }
+        [data-testid="stMain"] {
+            overflow-y: auto !important;
+        }
+        [data-testid="stTabContent"] {
+            overflow-y: visible !important;
+            padding-bottom: 5rem !important;
+        }
+        .main .block-container {
+            padding-bottom: 6rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.title("AI Car Screening Jabodetabek")
     st.caption("Analisa harga dari listing web yang ter-grounding.")
     user_input, analyze = _read_listing_form()
 
-    tab_screening, tab_history, tab_database = st.tabs([
+    tab_screening, tab_history, tab_database, tab_diagnostics = st.tabs([
         "🔍 Analisa Unit",
         "📋 Riwayat Analisa",
         "🏪 Database Listing Pasar",
+        "🩺 Diagnostik Lingkungan",
     ])
 
     with tab_history:
@@ -798,6 +824,10 @@ def render_app() -> None:
 
     with tab_database:
         _render_database_tab(cache)
+
+    with tab_diagnostics:
+        from src.diagnostics import render_environment_diagnostics
+        render_environment_diagnostics(cache, as_expander=False, key_prefix="tab_")
 
     with tab_screening:
         retry_triggered = st.session_state.pop("retry_requested", False)
@@ -905,9 +935,5 @@ def render_app() -> None:
             _render_analysis(result, saved_input, _COPY_SUMMARY_BUTTON)
         elif not st.session_state.get("pipeline_error"):
             st.info("Isi data unit di sidebar dan tekan **Analisa**. Hasil hanya memakai listing web yang lolos validasi sumber.")
-
-    st.divider()
-    from src.diagnostics import render_environment_diagnostics
-    render_environment_diagnostics(cache)
 
 

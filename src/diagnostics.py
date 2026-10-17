@@ -453,11 +453,15 @@ def format_diagnostics_as_text(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_environment_diagnostics(cache: SQLiteAnalysisCache) -> None:
-    """Render panel expander Diagnostik Lingkungan di Streamlit UI."""
+def render_environment_diagnostics(
+    cache: SQLiteAnalysisCache,
+    as_expander: bool = False,
+    key_prefix: str = "",
+) -> None:
+    """Render panel Diagnostik Lingkungan di Streamlit UI."""
     import streamlit as st
 
-    with st.expander("🩺 Diagnostik Lingkungan", expanded=False):
+    def _render_inner():
         # 1. Info Git & Versi
         git_info = get_git_info()
         time_info = get_server_time_info()
@@ -516,9 +520,10 @@ def render_environment_diagnostics(cache: SQLiteAnalysisCache) -> None:
         st.markdown("##### 🌐 Uji Konektivitas Marketplace (HEAD/GET timeout 5s)")
         st.caption("Pemeriksaan ringan untuk mendeteksi apakah server/cloud Anda diblokir oleh domain marketplace.")
 
-        # Tombol jalankan tes konektivitas
+        # Tombol jalankan tes konektivitas dengan key unik
         connectivity_key = "marketplace_connectivity_results"
-        run_test = st.button("🔄 Jalankan Uji Konektivitas Marketplace", key="btn_run_connectivity_test")
+        button_key = f"{key_prefix}btn_run_connectivity_test" if key_prefix else "btn_run_connectivity_test"
+        run_test = st.button("🔄 Jalankan Uji Konektivitas Marketplace", key=button_key)
 
         if run_test or connectivity_key in st.session_state:
             if run_test or connectivity_key not in st.session_state:
@@ -541,3 +546,10 @@ def render_environment_diagnostics(cache: SQLiteAnalysisCache) -> None:
             st.dataframe(table_display, use_container_width=True, hide_index=True)
         else:
             st.info("Tekan tombol di atas untuk menjalankan uji konektivitas ringan.")
+
+    if as_expander:
+        with st.expander("🩺 Diagnostik Lingkungan", expanded=False):
+            _render_inner()
+    else:
+        _render_inner()
+
