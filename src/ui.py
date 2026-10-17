@@ -783,31 +783,6 @@ def _render_database_tab(cache: SQLiteAnalysisCache) -> None:
 
 def render_app() -> None:
     cache = SQLiteAnalysisCache(CACHE_DB_PATH, ttl_seconds=86_400)
-
-    # CSS untuk menjamin scrollbar halaman aktif dan lancar saat menampilkan hasil screening
-    st.markdown(
-        """
-        <style>
-        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-            overflow-y: auto !important;
-            height: auto !important;
-            min-height: 100vh !important;
-        }
-        [data-testid="stMain"] {
-            overflow-y: auto !important;
-        }
-        [data-testid="stTabContent"] {
-            overflow-y: visible !important;
-            padding-bottom: 5rem !important;
-        }
-        .main .block-container {
-            padding-bottom: 6rem !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
     st.title("AI Car Screening Jabodetabek")
     st.caption("Analisa harga dari listing web yang ter-grounding.")
     user_input, analyze = _read_listing_form()
