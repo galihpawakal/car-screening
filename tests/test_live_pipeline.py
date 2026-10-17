@@ -487,8 +487,9 @@ class TestScoringFromLiveFacts:
 
 
 class TestFourStagePipeline:
-    def test_mocked_pipeline_caches_stages_one_to_three_without_dummy_fallback(self, tmp_path):
+    def test_mocked_pipeline_caches_stages_one_to_three_without_dummy_fallback(self, tmp_path, monkeypatch):
         from src.pipeline import query_cache_key, run_screening
+        monkeypatch.setattr("src.pipeline.crawl_marketplace_catalog", lambda *args, **kwargs: [])
 
         class FakeProvider:
             def __init__(self):
@@ -511,7 +512,7 @@ class TestFourStagePipeline:
                         grounding_calls=1,
                         marketplace=marketplace,
                     )
-                sources = [GroundingSource(f"https://market.example/car/{n}", f"Listing {n}") for n in range(1, 5)]
+                sources = [GroundingSource(f"https://market{n}.example/car/{n}", f"Listing {n}") for n in range(1, 5)]
                 text = "\n".join(f"{n}. Toyota Avanza G 2024 AT Rp {n * 100_000_000:,} km {n * 10_000:,}" for n in range(1, 5))
                 return GroundedSearchResult(
                     text=text,
@@ -530,7 +531,7 @@ class TestFourStagePipeline:
                 self.structured_schemas.append(response_model)
                 if response_model in (ListingExtraction, ListingPageExtraction):
                     for number in range(1, 5):
-                        url = f"https://market.example/car/{number}"
+                        url = f"https://market{number}.example/car/{number}"
                         if url in prompt:
                             record = extracted(
                                 price=f"Rp {number * 100_000_000:,}",

@@ -906,3 +906,8 @@ def render_app() -> None:
         elif not st.session_state.get("pipeline_error"):
             st.info("Isi data unit di sidebar dan tekan **Analisa**. Hasil hanya memakai listing web yang lolos validasi sumber.")
 
+    st.divider()
+    from src.diagnostics import render_environment_diagnostics
+    render_environment_diagnostics(cache)
+
+

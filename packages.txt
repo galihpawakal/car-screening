@@ -1,0 +1,3 @@
+# System dependencies for deployment (e.g. Streamlit Cloud / Debian)
+ca-certificates
+curl

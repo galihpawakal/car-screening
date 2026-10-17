@@ -27,6 +27,7 @@ class DailyLimitExceeded(RuntimeError):
 class SQLiteAnalysisCache:
     def __init__(self, path: str | Path, ttl_seconds: int = 86_400):
         self.path = Path(path)
+        self.existed_before_session = self.path.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.ttl_seconds = ttl_seconds
         self._initialize()
@@ -213,6 +214,33 @@ class SQLiteAnalysisCache:
             )
             connection.commit()
             return count
+
+    def get_daily_count(self, *, day: date | None = None) -> int:
+        """Return the current daily analysis count without claiming or incrementing."""
+        day_key = (day or datetime.now().date()).isoformat()
+        with self._connect() as connection:
+            row = connection.execute("SELECT analysis_count FROM daily_limits WHERE day = ?", (day_key,)).fetchone()
+            return int(row["analysis_count"]) if row else 0
+
+    def get_table_counts(self) -> dict[str, int]:
+        """Return row counts for key tables in the SQLite database."""
+        tables = [
+            "screening_history",
+            "grounding_cache",
+            "market_listings",
+            "query_cache",
+            "daily_limits",
+            "usage_logs",
+        ]
+        counts: dict[str, int] = {}
+        with self._connect() as connection:
+            for t in tables:
+                try:
+                    row = connection.execute(f"SELECT COUNT(*) as cnt FROM {t}").fetchone()
+                    counts[t] = int(row["cnt"]) if row else 0
+                except sqlite3.OperationalError:
+                    counts[t] = 0
+        return counts
 
     def record_usage(self, *, grounding_calls: int, input_tokens: int, output_tokens: int) -> str:
         analysis_id = str(uuid.uuid4())
