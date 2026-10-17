@@ -12,6 +12,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from google import genai
@@ -29,6 +30,108 @@ from src.url_resolve import ResolvedUrl, normalize_host, resolve_grounding_urls
 
 logger = logging.getLogger(__name__)
 DEBUG_LOG = os.environ.get("CAR_SCREENING_DEBUG") == "1"
+
+
+@dataclass(frozen=True)
+class GeminiErrorInfo:
+    http_code: int | None
+    category: str  # "quota" | "auth" | "timeout" | "server" | "unknown"
+    message: str   # Cleaned message without raw API key
+    is_retryable: bool
+
+
+class GroundingDeadlineExceeded(TimeoutError):
+    """Raised when global grounding deadline (120s) is exceeded across models/keys."""
+    pass
+
+
+def mask_api_keys(text: str, api_keys: list[str] | None = None) -> str:
+    """Mask Google API keys in error strings and logs."""
+    if not text:
+        return ""
+    masked = str(text)
+    masked = re.sub(r"AIza[0-9A-Za-z-_]{35}", "[REDACTED_API_KEY]", masked)
+    if api_keys:
+        for k in api_keys:
+            if k and len(k) > 6:
+                masked = masked.replace(k, "[REDACTED_API_KEY]")
+    return masked
+
+
+def classify_gemini_error(error: Exception, api_keys: list[str] | None = None) -> GeminiErrorInfo:
+    """Classify Gemini API errors with extracted HTTP code, category, and sanitized message."""
+    raw_str = str(error)
+    cleaned_msg = mask_api_keys(raw_str, api_keys)
+
+    # 1. Extract HTTP code
+    http_code = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if callable(http_code):
+        try:
+            http_code = http_code()
+        except Exception:
+            http_code = None
+    try:
+        http_code = int(http_code)
+    except (TypeError, ValueError):
+        http_code = None
+
+    if http_code is None:
+        code_match = re.search(r"\b(400|401|403|404|429|500|502|503|504)\b", raw_str)
+        if code_match:
+            http_code = int(code_match.group(1))
+
+    upper_msg = raw_str.upper()
+
+    # 2. Categorize
+    is_timeout = (
+        isinstance(error, (concurrent.futures.TimeoutError, TimeoutError))
+        or "DEADLINE_EXCEEDED" in upper_msg
+        or "TIMEOUT" in upper_msg
+        or http_code == 504
+    )
+    is_quota = (
+        http_code == 429
+        or "RESOURCE_EXHAUSTED" in upper_msg
+        or "RATE_LIMIT" in upper_msg
+        or "QUOTA" in upper_msg
+        or "TOO_MANY_REQUESTS" in upper_msg
+        or "PER DAY" in upper_msg
+    )
+    is_auth = (
+        http_code in (401, 403)
+        or "API_KEY_INVALID" in upper_msg
+        or "PERMISSION_DENIED" in upper_msg
+        or "UNAUTHENTICATED" in upper_msg
+        or "KEY NOT VALID" in upper_msg
+    )
+    is_server = (
+        (http_code is not None and 500 <= http_code <= 599 and http_code != 504)
+        or "UNAVAILABLE" in upper_msg
+        or "INTERNAL" in upper_msg
+    )
+
+    if is_timeout:
+        category = "timeout"
+        is_retryable = True
+    elif is_quota:
+        category = "quota"
+        is_retryable = True
+    elif is_auth:
+        category = "auth"
+        is_retryable = False
+    elif is_server:
+        category = "server"
+        is_retryable = True
+    else:
+        category = "unknown"
+        is_retryable = False
+
+    return GeminiErrorInfo(
+        http_code=http_code,
+        category=category,
+        message=cleaned_msg,
+        is_retryable=is_retryable,
+    )
 
 
 @dataclass(frozen=True)
@@ -282,7 +385,7 @@ class GeminiGroundingProvider(SearchProvider):
             http_opts = None
             try:
                 http_opts = types.HttpOptions(
-                    timeout=12_000,
+                    timeout=90_000,
                     retry_options=types.HttpRetryOptions(attempts=1),
                 )
             except Exception:
@@ -326,45 +429,181 @@ class GeminiGroundingProvider(SearchProvider):
         self.backoff_seconds = max(0.0, backoff_seconds)
         self.api_calls = 0
         self.attempt_history: list[dict] = []
-        self._lock = threading.Lock()
-        self._exhausted_client_indices: set[int] = set()
+        self._lock = threading.RLock()
+        self._exhausted_clients_meta: dict[int, dict] = {}
+        self._key_invalid_meta: dict[int, dict] = {}
+        self._grounding_disabled_meta: dict[int, dict] = {}
+        self._quota_exhausted_keys: dict[str, set[int]] = {}
+        shared_env = os.environ.get("GEMINI_KEYS_SHARED_PROJECT", "").strip().lower()
+        self.shared_project: bool = shared_env in ("1", "true", "yes")
 
-    def _next_available_client(self) -> tuple[Any, int] | None:
+    def _clean_expired_client_states(self, now: float | None = None) -> None:
+        t = now if now is not None else time.time()
+        with self._lock:
+            expired_exhausted = [i for i, m in self._exhausted_clients_meta.items() if t >= m.get("expiry", 0.0)]
+            for i in expired_exhausted:
+                del self._exhausted_clients_meta[i]
+            expired_invalid = [i for i, m in self._key_invalid_meta.items() if t >= m.get("expiry", 0.0)]
+            for i in expired_invalid:
+                del self._key_invalid_meta[i]
+            expired_grounding = [i for i, m in self._grounding_disabled_meta.items() if t >= m.get("expiry", 0.0)]
+            for i in expired_grounding:
+                del self._grounding_disabled_meta[i]
+
+    @property
+    def _exhausted_client_indices(self) -> set[int]:
+        self._clean_expired_client_states()
+        with self._lock:
+            return set(self._exhausted_clients_meta.keys())
+
+    def _is_key_invalid(self, idx: int, now: float | None = None) -> bool:
+        t = now if now is not None else time.time()
+        with self._lock:
+            if idx in self._key_invalid_meta:
+                if t < self._key_invalid_meta[idx].get("expiry", 0.0):
+                    return True
+                del self._key_invalid_meta[idx]
+            return False
+
+    def _is_grounding_disabled(self, idx: int, now: float | None = None) -> bool:
+        t = now if now is not None else time.time()
+        with self._lock:
+            if idx in self._grounding_disabled_meta:
+                if t < self._grounding_disabled_meta[idx].get("expiry", 0.0):
+                    return True
+                del self._grounding_disabled_meta[idx]
+            return False
+
+    def _mark_key_invalid(self, idx: int, http_code: int | None = 401, error_message: str = "", ttl: float = 3600.0) -> None:
+        now = time.time()
+        with self._lock:
+            self._key_invalid_meta[idx] = {
+                "timestamp": now,
+                "expiry": now + ttl,
+                "http_code": http_code,
+                "error_message": error_message or "API key tidak valid",
+            }
+
+    def _mark_grounding_disabled(self, idx: int, http_code: int | None = 403, error_message: str = "", ttl: float = 3600.0) -> None:
+        now = time.time()
+        with self._lock:
+            self._grounding_disabled_meta[idx] = {
+                "timestamp": now,
+                "expiry": now + ttl,
+                "http_code": http_code,
+                "error_message": error_message or "Permission denied on search grounding",
+            }
+
+    def _mark_client_exhausted(
+        self,
+        idx: int,
+        reason: str = "exhausted",
+        http_code: int | None = None,
+        error_message: str = "",
+        ttl: float | None = None,
+    ) -> None:
+        now = time.time()
+        if ttl is None:
+            if http_code == 429 or "quota" in reason.lower() or "429" in reason:
+                ttl = 300.0  # 5 menit untuk 429
+            elif "timeout" in reason.lower():
+                ttl = 60.0   # 60 detik untuk timeout
+            else:
+                ttl = 60.0
+        with self._lock:
+            self._exhausted_clients_meta[idx] = {
+                "timestamp": now,
+                "expiry": now + ttl,
+                "reason": reason,
+                "http_code": http_code,
+                "error_message": error_message or reason,
+            }
+            total = len(getattr(self, "clients", [1]))
+            if total > 1:
+                self.client_index = (idx + 1) % total
+
+    def _get_client_skip_info(self, idx: int, is_grounding: bool = False, now: float | None = None) -> tuple[str, int | None] | None:
+        t = now if now is not None else time.time()
+        with self._lock:
+            if idx in self._key_invalid_meta:
+                meta = self._key_invalid_meta[idx]
+                if t < meta.get("expiry", 0.0):
+                    dt = datetime.fromtimestamp(meta["timestamp"]).strftime("%H:%M:%S")
+                    code = meta.get("http_code", 401)
+                    err_msg = meta.get("error_message") or "API key tidak valid"
+                    return f"dilewati: ditandai tidak valid pada {dt}, kode {code}: {err_msg}", code
+                else:
+                    del self._key_invalid_meta[idx]
+
+            if is_grounding and idx in self._grounding_disabled_meta:
+                meta = self._grounding_disabled_meta[idx]
+                if t < meta.get("expiry", 0.0):
+                    dt = datetime.fromtimestamp(meta["timestamp"]).strftime("%H:%M:%S")
+                    code = meta.get("http_code", 403)
+                    err_msg = meta.get("error_message") or "Permission denied on grounding"
+                    return f"dilewati: grounding dinonaktifkan pada {dt}, kode {code}: {err_msg}", code
+                else:
+                    del self._grounding_disabled_meta[idx]
+
+            if idx in self._exhausted_clients_meta:
+                meta = self._exhausted_clients_meta[idx]
+                if t < meta.get("expiry", 0.0):
+                    dt = datetime.fromtimestamp(meta["timestamp"]).strftime("%H:%M:%S")
+                    code = meta.get("http_code")
+                    code_str = str(code) if code is not None else "-"
+                    err_msg = meta.get("error_message") or meta.get("reason") or "kuota habis"
+                    return f"dilewati: ditandai habis pada {dt}, kode {code_str}: {err_msg}", code
+                else:
+                    del self._exhausted_clients_meta[idx]
+
+            return None
+
+    def _next_available_client(self, is_grounding: bool = False) -> tuple[Any, int] | None:
+        self._clean_expired_client_states()
         with self._lock:
             clients = getattr(self, "clients", None)
             if not clients:
                 return self.client, 0
             total = len(clients)
+            now = time.time()
             for offset in range(total):
                 idx = (self.client_index + offset) % total
-                if idx not in self._exhausted_client_indices:
-                    return clients[idx], idx
+                if idx in self._exhausted_clients_meta:
+                    continue
+                if self._is_key_invalid(idx, now):
+                    continue
+                if is_grounding and self._is_grounding_disabled(idx, now):
+                    continue
+                return clients[idx], idx
             return None
 
-    def _mark_client_exhausted(self, idx: int) -> None:
-        with self._lock:
-            self._exhausted_client_indices.add(idx)
-            total = len(getattr(self, "clients", [1]))
-            if total > 1:
-                self.client_index = (idx + 1) % total
-
-    def find_first_available_key(self, model: str = "") -> int | None:
-        """Find the first API key not yet marked exhausted in memory, avoiding wasteful probe API calls."""
+    def find_first_available_key(self, model: str = "", is_grounding: bool = False) -> int | None:
+        self._clean_expired_client_states()
         clients = getattr(self, "clients", None)
+        now = time.time()
         if not clients or len(clients) <= 1:
-            return 0 if 0 not in self._exhausted_client_indices else None
+            if 0 in self._exhausted_clients_meta or self._is_key_invalid(0, now):
+                return None
+            if is_grounding and self._is_grounding_disabled(0, now):
+                return None
+            return 0
 
         total = len(clients)
         for offset in range(total):
             idx = (self.client_index + offset) % total
-            if idx not in self._exhausted_client_indices:
-                return idx
+            if idx in self._exhausted_clients_meta:
+                continue
+            if self._is_key_invalid(idx, now):
+                continue
+            if is_grounding and self._is_grounding_disabled(idx, now):
+                continue
+            return idx
         return None
 
     def _notify(self, message: str) -> None:
         if self.on_status and callable(self.on_status):
             try:
-                self.on_status(message)
+                self.on_status(mask_api_keys(message, getattr(self, "api_keys", None)))
             except Exception:
                 pass
 
@@ -379,127 +618,280 @@ class GeminiGroundingProvider(SearchProvider):
         candidates = self._candidate_models()
         last_error: Exception | None = None
         total_clients = len(getattr(self, "clients", [1]))
+        tools = kwargs.get("tools")
+        is_grounding = bool(tools)
 
-        for candidate_model in candidates:
-            # Fast scan to find an available API key without hanging on exhausted keys
-            if total_clients > 1:
-                available_idx = self.find_first_available_key(candidate_model)
-                if available_idx is None:
-                    if candidates.index(candidate_model) + 1 < len(candidates):
-                        next_model = candidates[candidates.index(candidate_model) + 1]
-                        self._notify(
-                            f"🔄 Seluruh key kuota habis pada `{candidate_model}`. Beralih ke model cadangan: `{next_model}`..."
-                        )
+        default_call_timeout = 90.0 if is_grounding else 60.0
+        global_deadline = time.time() + 120.0 if is_grounding else None
+
+        for pass_num in range(2):
+            real_api_calls_in_request = 0
+
+            for candidate_model in candidates:
+                if global_deadline is not None and time.time() >= global_deadline:
+                    raise GroundingDeadlineExceeded("Deadline global tahap grounding (120 detik) terlampaui.")
+
+                start_index = self.client_index
+                for offset in range(total_clients):
+                    if global_deadline is not None and time.time() >= global_deadline:
+                        raise GroundingDeadlineExceeded("Deadline global tahap grounding (120 detik) terlampaui.")
+
+                    client_idx = (start_index + offset) % total_clients
+                    active_client = self.clients[client_idx] if getattr(self, "clients", None) else self.client
+
+                    # Periksa apakah key ini dilewati
+                    skip_info = self._get_client_skip_info(client_idx, is_grounding=is_grounding)
+                    if skip_info is not None:
+                        skip_msg, skip_code = skip_info
+                        self.attempt_history.append({
+                            "model": candidate_model,
+                            "attempt": 0,
+                            "key_index": client_idx,
+                            "success": False,
+                            "http_code": skip_code,
+                            "category": "skipped",
+                            "error": skip_msg,
+                            "retryable": False,
+                        })
+                        if last_error is None:
+                            last_error = RuntimeError(skip_msg)
                         continue
-                    break
 
-            checked_indices: set[int] = set()
-            while len(checked_indices) < total_clients:
-                client_info = self._next_available_client()
-                if client_info is None:
-                    break
+                    key_tag = f" (key #{client_idx + 1}/{total_clients})" if total_clients > 1 else ""
+                    action_desc = "sedang menelusuri listing di web" if is_grounding else "memproses data terstruktur"
+                    self._notify(
+                        f"🌐 Menghubungi model `{candidate_model}`{key_tag} ({action_desc})..."
+                    )
 
-                active_client, client_idx = client_info
-                if client_idx in checked_indices:
-                    break
-                checked_indices.add(client_idx)
+                    key_failed = False
+                    timeout_retries_on_this_key = 0
+                    max_timeout_retries = 2
 
-                key_tag = f" (key #{client_idx + 1}/{total_clients})" if total_clients > 1 else ""
-                tools = kwargs.get("tools")
-                action_desc = "sedang menelusuri listing di web" if tools else "memproses data terstruktur"
-                self._notify(
-                    f"🌐 Menghubungi model `{candidate_model}`{key_tag} ({action_desc})..."
-                )
+                    for attempt in range(self.max_retries):
+                        if global_deadline is not None and time.time() >= global_deadline:
+                            raise GroundingDeadlineExceeded("Deadline global tahap grounding (120 detik) terlampaui.")
 
-                key_failed = False
-                for attempt in range(self.max_retries):
-                    self.api_calls += 1
-                    try:
-                        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                        future = executor.submit(active_client.interactions.create, model=candidate_model, **kwargs)
+                        self.api_calls += 1
+                        real_api_calls_in_request += 1
+                        call_timeout = default_call_timeout
+                        if global_deadline is not None:
+                            remaining = global_deadline - time.time()
+                            call_timeout = min(call_timeout, max(1.0, remaining))
+
                         try:
-                            response = future.result(timeout=12.0)
-                        finally:
-                            executor.shutdown(wait=False)
+                            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                            future = executor.submit(active_client.interactions.create, model=candidate_model, **kwargs)
+                            try:
+                                response = future.result(timeout=call_timeout)
+                            finally:
+                                executor.shutdown(wait=False)
 
-                        self.active_model = candidate_model
-                        self.last_used_model = candidate_model
-                        self.attempt_history.append(
-                            {"model": candidate_model, "attempt": attempt + 1, "success": True, "error": None}
-                        )
-                        self._notify(f"✅ Model `{candidate_model}` berhasil merespons via key #{client_idx + 1}.")
-                        with self._lock:
-                            self.client_index = client_idx
-                        return response, candidate_model
-                    except concurrent.futures.TimeoutError:
-                        self._mark_client_exhausted(client_idx)
-                        remaining = total_clients - len(self._exhausted_client_indices)
-                        self._notify(
-                            f"⚠️ Key #{client_idx + 1} tidak merespons (timeout 12s). Langsung beralih ke key berikutnya ({remaining} key tersisa)..."
-                        )
-                        key_failed = True
-                        break
-                    except Exception as error:
-                        last_error = error
-                        err_msg = str(error)
-                        is_quota_exhausted = (
-                            "RESOURCE_EXHAUSTED" in err_msg
-                            or "429" in err_msg
-                            or "too_many_requests" in err_msg
-                            or "quota" in err_msg.lower()
-                            or "limit:" in err_msg
-                            or "per day" in err_msg.lower()
-                        )
-                        if is_quota_exhausted:
-                            self._mark_client_exhausted(client_idx)
-                            remaining = total_clients - len(self._exhausted_client_indices)
-                            if remaining > 0:
-                                self._notify(
-                                    f"⚠️ API key #{client_idx + 1} kuota habis/tidak tersedia. Langsung beralih ke key berikutnya ({remaining} key tersisa)..."
-                                )
-                            else:
-                                self._notify(
-                                    f"⚠️ API key #{client_idx + 1} kuota habis. Seluruh {total_clients} API key telah habis."
-                                )
-                            key_failed = True
-                            break
-
-                        is_retry = _is_retryable(error)
-                        self.attempt_history.append(
-                            {
-                                "model": candidate_model,
-                                "attempt": attempt + 1,
-                                "success": False,
-                                "error": err_msg,
-                                "retryable": is_retry,
-                            }
-                        )
-
-                        if attempt + 1 < self.max_retries and is_retry:
-                            delay = self.backoff_seconds * (2**attempt)
-                            self._notify(
-                                f"⚠️ Key #{client_idx + 1} terkendala ({error}). Menunggu jeda {delay:.1f} detik untuk retry..."
+                            self.active_model = candidate_model
+                            self.last_used_model = candidate_model
+                            self.attempt_history.append(
+                                {
+                                    "model": candidate_model,
+                                    "attempt": attempt + 1,
+                                    "key_index": client_idx,
+                                    "success": True,
+                                    "http_code": 200,
+                                    "category": "success",
+                                    "error": None,
+                                }
                             )
-                            if delay > 0:
-                                time.sleep(delay)
-                            continue
-                        else:
-                            key_failed = True
+                            self._notify(f"✅ Model `{candidate_model}` berhasil merespons via key #{client_idx + 1}.")
+                            with self._lock:
+                                self.client_index = client_idx
+                            return response, candidate_model
+
+                        except concurrent.futures.TimeoutError as timeout_err:
+                            last_error = timeout_err
+                            err_info = classify_gemini_error(timeout_err, getattr(self, "api_keys", None))
+                            self.attempt_history.append(
+                                {
+                                    "model": candidate_model,
+                                    "attempt": attempt + 1,
+                                    "key_index": client_idx,
+                                    "success": False,
+                                    "http_code": err_info.http_code,
+                                    "category": err_info.category,
+                                    "error": err_info.message,
+                                    "retryable": True,
+                                }
+                            )
+
+                            if timeout_retries_on_this_key < max_timeout_retries:
+                                timeout_retries_on_this_key += 1
+                                delay = self.backoff_seconds * (2 ** (timeout_retries_on_this_key - 1))
+                                self._notify(
+                                    f"⚠️ Key #{client_idx + 1} tidak merespons (timeout {int(call_timeout)}s). Retry {timeout_retries_on_this_key}/{max_timeout_retries} pada key yang sama (jeda {delay:.1f}s)..."
+                                )
+                                if delay > 0:
+                                    time.sleep(delay)
+                                continue
+                            else:
+                                self._mark_client_exhausted(
+                                    client_idx,
+                                    reason="timeout",
+                                    http_code=err_info.http_code or 504,
+                                    error_message=f"Timeout {int(call_timeout)}s",
+                                    ttl=60.0,
+                                )
+                                remaining_keys = total_clients - len(self._exhausted_client_indices)
+                                self._notify(
+                                    f"⚠️ Key #{client_idx + 1} berulang kali timeout ({max_timeout_retries}x retry gagal). Beralih ke key berikutnya ({remaining_keys} key tersisa)..."
+                                )
+                                key_failed = True
+                                break
+
+                        except Exception as error:
+                            last_error = error
+                            err_info = classify_gemini_error(error, getattr(self, "api_keys", None))
+                            self.attempt_history.append(
+                                {
+                                    "model": candidate_model,
+                                    "attempt": attempt + 1,
+                                    "key_index": client_idx,
+                                    "success": False,
+                                    "http_code": err_info.http_code,
+                                    "category": err_info.category,
+                                    "error": err_info.message,
+                                    "retryable": err_info.is_retryable,
+                                }
+                            )
+
+                            if err_info.category == "quota":
+                                if attempt + 1 < self.max_retries and err_info.is_retryable:
+                                    delay = self.backoff_seconds * (2 ** attempt)
+                                    self._notify(
+                                        f"⚠️ Key #{client_idx + 1} kuota/rate limit (429). Menunggu jeda {delay:.1f} detik untuk retry..."
+                                    )
+                                    if delay > 0:
+                                        time.sleep(delay)
+                                    continue
+
+                                self._mark_client_exhausted(
+                                    client_idx,
+                                    reason="429 quota",
+                                    http_code=429,
+                                    error_message=err_info.message or "Quota 429",
+                                    ttl=300.0,
+                                )
+                                self._quota_exhausted_keys.setdefault(candidate_model, set()).add(client_idx)
+                                shared_detected = (
+                                    self.shared_project
+                                    or len(self._quota_exhausted_keys[candidate_model]) >= 2
+                                )
+                                if shared_detected:
+                                    self._notify(
+                                        f"⚠️ Kuota habis (429) pada model `{candidate_model}` (terdeteksi project bersama). Menghentikan rotasi key, langsung beralih ke model cadangan..."
+                                    )
+                                    key_failed = True
+                                    break
+
+                                remaining_keys = total_clients - len(self._exhausted_client_indices)
+                                if remaining_keys > 0:
+                                    self._notify(
+                                        f"⚠️ API key #{client_idx + 1} kuota habis/429. Beralih ke key berikutnya ({remaining_keys} key tersisa)..."
+                                    )
+                                else:
+                                    self._notify(
+                                        f"⚠️ Seluruh {total_clients} API key telah habis kuota pada model `{candidate_model}`."
+                                    )
+                                key_failed = True
+                                break
+
+                            if err_info.category == "auth":
+                                if is_grounding and err_info.http_code == 403:
+                                    self._mark_grounding_disabled(
+                                        client_idx,
+                                        http_code=403,
+                                        error_message=err_info.message or "Permission denied on search grounding",
+                                        ttl=3600.0,
+                                    )
+                                    self._notify(
+                                        f"⚠️ API key #{client_idx + 1} tidak memiliki izin grounding (403). Fitur grounding dinonaktifkan sementara untuk key ini..."
+                                    )
+                                else:
+                                    self._mark_key_invalid(
+                                        client_idx,
+                                        http_code=err_info.http_code or 401,
+                                        error_message=err_info.message or "Auth error",
+                                        ttl=3600.0,
+                                    )
+                                    self._mark_client_exhausted(
+                                        client_idx,
+                                        reason="auth invalid",
+                                        http_code=err_info.http_code or 401,
+                                        error_message=err_info.message or "Auth error",
+                                        ttl=3600.0,
+                                    )
+                                    self._notify(
+                                        f"⚠️ API key #{client_idx + 1} tidak valid/tertolak ({err_info.http_code or 'auth error'}). Menonaktifkan key ini sementara..."
+                                    )
+                                key_failed = True
+                                break
+
+                            if attempt + 1 < self.max_retries and err_info.is_retryable:
+                                delay = self.backoff_seconds * (2 ** attempt)
+                                self._notify(
+                                    f"⚠️ Key #{client_idx + 1} terkendala ({err_info.category}: {err_info.http_code or ''}). Menunggu jeda {delay:.1f} detik untuk retry..."
+                                )
+                                if delay > 0:
+                                    time.sleep(delay)
+                                continue
+                            else:
+                                key_failed = True
+                                break
+
+                    if key_failed:
+                        if len(self._quota_exhausted_keys.get(candidate_model, set())) >= 2 or self.shared_project:
                             break
+                        continue
 
-                if key_failed:
+                if candidates.index(candidate_model) + 1 < len(candidates):
+                    next_model = candidates[candidates.index(candidate_model) + 1]
+                    self._notify(
+                        f"🔄 Model `{candidate_model}` tidak tersedia. Beralih ke model cadangan: `{next_model}`..."
+                    )
+
+            # Jika SEMUA key dilewati tanpa satu pun panggilan nyata pada pass 0:
+            if real_api_calls_in_request == 0 and pass_num == 0:
+                now = time.time()
+                reset_count = 0
+                with self._lock:
+                    keys_to_reset = [
+                        idx for idx, meta in self._exhausted_clients_meta.items()
+                        if (now - meta["timestamp"]) >= 60.0 or now >= meta["expiry"]
+                    ]
+                    for idx in keys_to_reset:
+                        del self._exhausted_clients_meta[idx]
+                        reset_count += 1
+                if reset_count > 0:
+                    self._notify(
+                        f"🔄 Seluruh key dilewati tanpa panggilan nyata. Mereset {reset_count} key yang habis > 60s lalu dan mencoba ulang..."
+                    )
                     continue
-
-            if candidates.index(candidate_model) + 1 < len(candidates):
-                next_model = candidates[candidates.index(candidate_model) + 1]
-                self._notify(
-                    f"🔄 Model `{candidate_model}` tidak tersedia. Beralih ke model cadangan: `{next_model}`..."
-                )
+            break
 
         models_tried = ", ".join(candidates)
-        raise RuntimeError(
-            f"Semua model Gemini ({models_tried}) gagal setelah retry. Error terakhir: {last_error}"
-        ) from last_error
+        error_lines = [f"Semua model Gemini ({models_tried}) gagal setelah retry."]
+        if self.attempt_history:
+            error_lines.append("Rincian per percobaan:")
+            for entry in self.attempt_history:
+                m = entry.get("model", "-")
+                k_idx = entry.get("key_index", 0)
+                k_str = f"key #{k_idx + 1}"
+                code_str = str(entry.get("http_code")) if entry.get("http_code") is not None else "-"
+                msg = entry.get("error") or "Unknown error"
+                msg_clean = mask_api_keys(msg, getattr(self, "api_keys", None))
+                error_lines.append(f"- [{m}, {k_str}, HTTP: {code_str}]: {msg_clean}")
+        else:
+            cleaned_last_err = mask_api_keys(str(last_error or "Tidak ada panggilan yang dieksekusi"), getattr(self, "api_keys", None))
+            error_lines.append(f"Error: {cleaned_last_err}")
+
+        final_err_msg = "\n".join(error_lines)
+        raise RuntimeError(final_err_msg) from last_error
 
     def search(self, prompt: str, *, marketplace: str = "") -> GroundedSearchResult:
         self._notify("🔍 Menjalankan pencarian web Google Search grounding...")

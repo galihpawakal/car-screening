@@ -94,26 +94,26 @@ def test_model(title: str, user_input: dict):
 
 
 if __name__ == "__main__":
-    # Model 1: Daihatsu Xenia E 2020 AT (The problem case)
-    test_model("1. Daihatsu Xenia E 2020 AT", {
-        "brand": "Daihatsu",
-        "model": "Xenia",
+    # Model 1: Nissan Grand Livina E 2020 AT (Bug A case)
+    test_model("1. Nissan Grand Livina E 2020 AT", {
+        "brand": "Nissan",
+        "model": "Grand Livina",
         "variant": "E",
         "year": 2020,
         "transmission": "AT",
         "body_type": "MPV",
-        "kilometer": 80000,
+        "kilometer": 60000,
         "location": "Jakarta Pusat",
         "plate_code": "B",
-        "listing_price": 100_000_000,
-        "deskripsi": "Kondisi terawat, siap pakai, pemakaian pribadi.",
+        "listing_price": 125_000_000,
+        "deskripsi": "Kondisi sangat mulus, siap pakai, mesin kering.",
         "search_mode": "direct",
     })
 
-    # Model 2: Toyota Avanza G 2020 AT
-    test_model("2. Toyota Avanza G 2020 AT", {
+    # Model 2: Toyota All New Avanza G 2020 AT
+    test_model("2. Toyota All New Avanza G 2020 AT", {
         "brand": "Toyota",
-        "model": "Avanza",
+        "model": "All New Avanza",
         "variant": "G",
         "year": 2020,
         "transmission": "AT",
@@ -126,18 +126,18 @@ if __name__ == "__main__":
         "search_mode": "direct",
     })
 
-    # Model 3: Honda Brio RS 2020 AT
-    test_model("3. Honda Brio RS 2020 AT", {
+    # Model 3: Honda Brio Satya 2020 AT
+    test_model("3. Honda Brio Satya 2020 AT", {
         "brand": "Honda",
-        "model": "Brio",
-        "variant": "RS",
+        "model": "Brio Satya",
+        "variant": "E",
         "year": 2020,
         "transmission": "AT",
         "body_type": "Hatchback",
         "kilometer": 45000,
         "location": "Jakarta Barat",
         "plate_code": "B",
-        "listing_price": 160_000_000,
+        "listing_price": 140_000_000,
         "deskripsi": "Mobil mulus tangan pertama dari baru, terawat.",
         "search_mode": "direct",
     })

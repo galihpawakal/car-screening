@@ -1,5 +1,4 @@
-"""Unit tests for tiered comparable screening, catalog URL building, slug prefiltering, and low comparables logic."""
-
+import re
 import pytest
 from src.extract import ExtractedListing
 from src.marketplace_config import (
@@ -110,7 +109,12 @@ def test_twin_models_map():
 
 def test_tiered_fallback_logic():
     # Helper to generate dummy ExtractedListing
-    def _make_candidate(url, model, variant, year, trans, price="150000000", km="50000", loc="Jakarta Selatan"):
+    def _make_candidate(url, model, variant, year, trans, price="150000000", km=None, loc="Jakarta Selatan"):
+        if km is None:
+            digits = re.sub(r'[^0-9]', '', url)
+            idx = int(digits) if digits else 0
+            km_val = 40000 + idx * 5000
+            km = str(km_val)
         return ExtractedListing(
             brand="Daihatsu" if "xenia" in model.lower() else "Toyota",
             model=model,

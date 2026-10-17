@@ -69,9 +69,10 @@ MARKETPLACE_URL_PATTERNS: dict[str, dict[str, list[re.Pattern]]] = {
         "detail": [
             re.compile(r"^/(?:detail|review|mobil)/.*-\d+\.html$", re.IGNORECASE),
             re.compile(r"^/iklan/.*", re.IGNORECASE),
+            re.compile(r"^/[^/]+/[^/]+/\d+-[^/]+\.html$", re.IGNORECASE),
         ],
         "listing": [
-            re.compile(r"^/(?:mobil-bekas|cari-mobil)(?:/|$)", re.IGNORECASE),
+            re.compile(r"^/(?:mobil-bekas|cari-mobil|search)(?:/|$)", re.IGNORECASE),
         ],
     },
 }
@@ -242,12 +243,58 @@ def extract_detail_links_from_html(
             # If expected model is given, verify it appears in the URL slug or anchor text
             if model_clean:
                 slug_or_text = (clean_url + " " + anchor.get_text(" ")).lower()
-                if model_clean not in slug_or_text:
+                hyphen_model = re.sub(r"[\s_]+", "-", model_clean)
+                nospace_model = re.sub(r"[\s_-]+", "", model_clean)
+                core_tokens = [
+                    w for w in re.split(r"[\s_-]+", model_clean)
+                    if w and w not in ("all", "new", "the", "satya", "reborn", "facelift")
+                ]
+                matches_model = (
+                    model_clean in slug_or_text
+                    or hyphen_model in slug_or_text
+                    or nospace_model in slug_or_text
+                    or (bool(core_tokens) and all(token in slug_or_text for token in core_tokens))
+                    or ("livina" in model_clean and "livina" in slug_or_text)
+                    or ("avanza" in model_clean and "avanza" in slug_or_text)
+                    or ("brio" in model_clean and "brio" in slug_or_text)
+                    or ("xenia" in model_clean and "xenia" in slug_or_text)
+                )
+                if not matches_model:
                     # Model not mentioned, might be another vehicle on the same listing page
                     continue
 
             seen.add(clean_url)
             found_links.append(clean_url)
+            if len(found_links) >= max_links:
+                break
+
+    # If few or no links found from anchors, inspect script tags (__NEXT_DATA__, application/ld+json, inline JS)
+    if len(found_links) < max_links:
+        for script in soup.find_all("script"):
+            content = script.string or script.get_text() or ""
+            if not content or len(content) < 10:
+                continue
+
+            # Look for detail URL paths embedded in JSON or JavaScript strings
+            potential_paths = re.findall(r'["\'](/(?:beli-mobil-bekas|dijual|listing|item|detail|[^/]+/[^/]+/\d+-[^/]+\.html)[^"\']*)["\']', content)
+            for path in potential_paths:
+                abs_url = urljoin(base_url, path)
+                parsed_target = urlsplit(abs_url)
+                target_host = _normalize_host(parsed_target.netloc)
+                if target_host != base_host and not target_host.endswith("." + base_host):
+                    continue
+                clean_url = urlunsplit((parsed_target.scheme, parsed_target.netloc, parsed_target.path.rstrip("/"), "", ""))
+                if clean_url in seen:
+                    continue
+                if classify_url(clean_url) == "detail":
+                    if model_clean:
+                        slug_lower = clean_url.lower()
+                        if model_clean not in slug_lower and not any(t in slug_lower for t in re.split(r"[\s_-]+", model_clean) if len(t) >= 4):
+                            continue
+                    seen.add(clean_url)
+                    found_links.append(clean_url)
+                    if len(found_links) >= max_links:
+                        break
             if len(found_links) >= max_links:
                 break
 

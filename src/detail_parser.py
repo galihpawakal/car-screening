@@ -306,17 +306,25 @@ def parse_detail_page(
     og = _parse_open_graph(soup)
 
     # 1. Brand & Model
-    brand = json_ld.get("brand") or expected_brand or UNKNOWN
-    model = json_ld.get("model") or expected_model or UNKNOWN
-
-    # Check og:title or title tag for Brand & Model if still unknown
     page_title = og.get("og:title") or (soup.title.string if soup.title else "") or ""
+    title_lower = (page_title + " " + (json_ld.get("name") or "")).lower()
+
+    brand = json_ld.get("brand") or UNKNOWN
     if brand == UNKNOWN and expected_brand:
-        if expected_brand.lower() in page_title.lower():
+        if expected_brand.lower() in title_lower:
             brand = expected_brand
-    if model == UNKNOWN and expected_model:
-        if expected_model.lower() in page_title.lower():
+        else:
+            brand = expected_brand
+
+    model = json_ld.get("model") or UNKNOWN
+    # Model specific check: Grand Livina vs Livina
+    if "grand livina" in title_lower:
+        model = "Grand Livina"
+    elif model == UNKNOWN:
+        if expected_model and expected_model.lower() in title_lower:
             model = expected_model
+        else:
+            model = expected_model or UNKNOWN
 
     # 2. Variant
     variant = UNKNOWN
@@ -389,9 +397,6 @@ def parse_detail_page(
     loc_str = json_ld.get("location")
     if not loc_str or loc_str == UNKNOWN:
         loc_str = extract_location(page_title + " " + og.get("og:description", "") + " " + soup.get_text(" ")[:5000])
-
-    # 8. Seller description
-    description = json_ld.get("description") or og.get("og:description") or ""
 
     # Normalize values
     norm_price = normalize_price(price_str)

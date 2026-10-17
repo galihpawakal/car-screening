@@ -79,6 +79,7 @@ def get_market_confidence(
     count: int,
     price_spread_ratio: float | None,
     completeness_pct: float,
+    unique_domains_count: int = 0,
 ) -> dict[str, str]:
     """Classify estimate confidence from source count, price spread, and input completeness.
 
@@ -87,33 +88,50 @@ def get_market_confidence(
       2     -> Rendah (indikatif)
       3-5   -> Sedang
       >= 6  -> Tinggi
+
+    Jika semua pembanding valid berasal dari 1 domain unik:
+      Turunkan tingkat keyakinan satu tingkat dan tambahkan catatan.
+    Jika sebaran harga < 5% dengan n <= 5:
+      Tambahkan catatan sebaran sangat rapat.
     """
     spread = price_spread_ratio if price_spread_ratio is not None else 1.0
     if count < MIN_COMPARABLES:  # < 2
-        return {
-            "level": "Sangat rendah",
-            "reason": f"Data pembanding kurang dari {MIN_COMPARABLES} ({count}); skor tidak dihitung dan rentang harga berkeyakinan sangat rendah.",
-        }
-    if count < SOLID_COMPARABLES:  # 2
-        return {
-            "level": "Rendah",
-            "reason": f"Data pembanding kurang dari {SOLID_COMPARABLES} ({count}); estimasi bersifat indikatif (data sedikit).",
-        }
-    if count < 6:  # 3-5
-        return {
-            "level": "Sedang",
-            "reason": (
-                f"Berdasarkan {count} pembanding, sebaran harga {spread:.0%}, "
-                f"dan kelengkapan input {completeness_pct:.0f}%."
-            ),
-        }
-    # >= 6
-    return {
-        "level": "Tinggi",
-        "reason": (
+        level = "Sangat rendah"
+        reason = f"Data pembanding kurang dari {MIN_COMPARABLES} ({count}); skor tidak dihitung dan rentang harga berkeyakinan sangat rendah."
+    elif count < SOLID_COMPARABLES:  # 2
+        level = "Rendah"
+        reason = f"Data pembanding kurang dari {SOLID_COMPARABLES} ({count}); estimasi bersifat indikatif (data sedikit)."
+    elif count < 6:  # 3-5
+        level = "Sedang"
+        reason = (
             f"Berdasarkan {count} pembanding, sebaran harga {spread:.0%}, "
             f"dan kelengkapan input {completeness_pct:.0f}%."
-        ),
+        )
+    else:  # >= 6
+        level = "Tinggi"
+        reason = (
+            f"Berdasarkan {count} pembanding, sebaran harga {spread:.0%}, "
+            f"dan kelengkapan input {completeness_pct:.0f}%."
+        )
+
+    # Catatan jika sebaran harga sangat rapat (< 5%) pada n <= 5
+    if price_spread_ratio is not None and price_spread_ratio < 0.05 and count <= 5 and count >= MIN_COMPARABLES:
+        reason += ", sebaran sangat rapat, periksa kemungkinan listing dari dealer yang sama"
+
+    # Penalti 1 domain unik: turunkan 1 tingkat
+    if unique_domains_count == 1 and count >= MIN_COMPARABLES:
+        level_map = {
+            "Tinggi": "Sedang",
+            "Sedang": "Rendah",
+            "Rendah": "Sangat rendah",
+            "Sangat rendah": "Sangat rendah",
+        }
+        level = level_map.get(level, level)
+        reason += " Semua pembanding berasal dari 1 sumber."
+
+    return {
+        "level": level,
+        "reason": reason,
     }
 
 
@@ -495,7 +513,9 @@ def format_screening_result(result: ScreeningResult) -> dict:
 
 
 def negotiation_advice_text(price_diff_pct: float, n_comparables: int) -> str | None:
-    """Return advisory text when comparables < 3 or listing is below market; None when negotiation makes sense."""
+    """Return advisory text when comparables < 3, price is unreasonable, or listing is below market; None when negotiation makes sense."""
+    if abs(price_diff_pct) > 0.50:
+        return "Harga tidak wajar terhadap pasar; kemungkinan salah ketik, harga DP, atau penipuan. Tidak ada saran negosiasi."
     if n_comparables < 3:
         return (
             "Belum ada cukup pembanding untuk saran tawar. "

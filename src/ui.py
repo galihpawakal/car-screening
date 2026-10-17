@@ -180,10 +180,19 @@ def _summary_text(result: ScreeningPipelineResult, user_input: dict) -> str:
     ]
     if is_indicative:
         lines.insert(3, "Mode: INDIKATIF - data sangat sedikit")
-    nego = result.final_analysis.saran_nego
-    if nego.awal is not None:
-        lines.append(f"Negosiasi awal/target/batas: {_format_price(nego.awal)} / {_format_price(nego.realistis)} / {_format_price(nego.batas)}")
-    lines.extend(f"Sumber: {source.url}" for source in result.sources)
+    price_median = stats.get("price_median") or 0
+    listing_price = int(user_input.get("listing_price") or 0)
+    is_unreasonable = price_median > 0 and abs(listing_price - price_median) / price_median > 0.50
+
+    if is_unreasonable:
+        lines.append("Saran negosiasi: Harga tidak wajar terhadap pasar; kemungkinan salah ketik, harga DP, atau penipuan. Tidak ada saran negosiasi.")
+    else:
+        nego = result.final_analysis.saran_nego
+        if nego.awal is not None:
+            lines.append(f"Negosiasi awal/target/batas: {_format_price(nego.awal)} / {_format_price(nego.realistis)} / {_format_price(nego.batas)}")
+
+    # Sumber hanya berisi pembanding yang LOLOS dan dipakai menghitung median
+    lines.extend(f"Sumber: {item.source_url}" for item in result.comparables)
     lines.append(DISCLAIMER)
     return "\n".join(lines)
 
@@ -261,7 +270,6 @@ def _render_comparables(result: ScreeningPipelineResult, listing_price: int) -> 
         if getattr(item, "page_type", "detail") != "detail":
             continue
         diff_pct = (item.price - listing_price) / listing_price * 100 if listing_price else 0
-        domain = urlsplit(item.source_url).netloc if item.source_url else "-"
         tier_val = getattr(item, "tier", 1)
         tier_display = f"Tier {tier_val}"
         if getattr(item, "is_twin_model", False):
@@ -318,11 +326,36 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
         f3.metric("Detail Terbaca", fm.get("detail_pages_parsed", 0))
         f4.metric("Lolos Validasi", fm.get("valid_comparables", 0))
 
+        # Tampilkan alasan nol secara eksplisit per marketplace
+        if getattr(result, "catalog_urls_opened", None):
+            domain_summary: dict[str, str] = {}
+            for cat in result.catalog_urls_opened:
+                dom = cat.get("domain", "")
+                if not dom:
+                    continue
+                links = cat.get("links_found", 0)
+                reason = cat.get("failure_reason")
+                if links > 0:
+                    domain_summary[dom] = f"**{dom}**: {links} tautan detail"
+                elif dom not in domain_summary:
+                    if reason:
+                        clean_reason = reason.replace(f"{dom}: ", "")
+                        domain_summary[dom] = f"**{dom}**: {clean_reason}"
+                    else:
+                        domain_summary[dom] = f"**{dom}**: 0 tautan (halaman kosong)"
+
+            if domain_summary:
+                st.markdown("**Status per Marketplace:** " + " • ".join(domain_summary.values()))
+
     model_display = result.model_used or "Gemini"
     if result.warning:
         st.error(result.warning, icon=":material/warning:")
     if result.ai_error:
         st.warning(result.ai_error)
+    if getattr(result, "debug_error", None):
+        with st.expander("Detail debug AI / error validasi", expanded=False):
+            st.caption("Detail teknis error/kendala model AI:")
+            st.code(result.debug_error)
     if result.cache_hit:
         st.caption(f"🤖 Model AI: **{model_display}** (Data listing dimuat dari cache SQLite 24 jam).")
     else:
@@ -383,17 +416,20 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
     price_median = stats.get("price_median") or 0
     listing_price = int(user_input.get("listing_price") or 0)
     price_diff_pct = (listing_price - price_median) / price_median if price_median > 0 else 0
-    nego_warning = negotiation_advice_text(price_diff_pct, stats["count"])
-    if nego_warning is not None:
-        st.info(nego_warning)
-    elif nego.awal is None:
-        st.info("Saran nominal belum tersedia karena tidak ada median pembanding nyata.")
+    if price_median > 0 and abs(price_diff_pct) > 0.50:
+        st.info("Harga tidak wajar terhadap pasar; kemungkinan salah ketik, harga DP, atau penipuan. Tidak ada saran negosiasi.")
     else:
-        opening, target, maximum = st.columns(3)
-        opening.metric("Tawar awal (estimasi)", _format_price_compact(nego.awal), help=_format_price(nego.awal))
-        target.metric("Target realistis (estimasi)", _format_price_compact(nego.realistis), help=_format_price(nego.realistis))
-        maximum.metric("Batas maksimal (estimasi)", _format_price_compact(nego.batas), help=_format_price(nego.batas))
-        st.caption("Estimasi dari harga listing pembanding dikoreksi 3-10%. Bukan harga transaksi terverifikasi.")
+        nego_warning = negotiation_advice_text(price_diff_pct, stats["count"])
+        if nego_warning is not None:
+            st.info(nego_warning)
+        elif nego.awal is None:
+            st.info("Saran nominal belum tersedia karena tidak ada median pembanding nyata.")
+        else:
+            opening, target, maximum = st.columns(3)
+            opening.metric("Tawar awal (estimasi)", _format_price_compact(nego.awal), help=_format_price(nego.awal))
+            target.metric("Target realistis (estimasi)", _format_price_compact(nego.realistis), help=_format_price(nego.realistis))
+            maximum.metric("Batas maksimal (estimasi)", _format_price_compact(nego.batas), help=_format_price(nego.batas))
+            st.caption("Estimasi dari harga listing pembanding dikoreksi 3-10%. Bukan harga transaksi terverifikasi.")
 
     st.subheader("Posisi di pasar")
     n_count = stats["count"]
@@ -417,10 +453,14 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
     st.subheader("Tabel pembanding")
     _render_comparables(result, user_input["listing_price"])
 
-    # Saran tindakan saat 0 pembanding
-    if n_count == 0 and getattr(result, "manual_search_urls", None):
+    # Saran tindakan saat 0 pembanding atau semua katalog gagal
+    all_catalogs_failed = False
+    if getattr(result, "catalog_urls_opened", None):
+        all_catalogs_failed = all(c.get("links_found", 0) == 0 for c in result.catalog_urls_opened)
+
+    if (n_count == 0 or all_catalogs_failed) and getattr(result, "manual_search_urls", None):
         st.markdown("#### 🔍 Buka Pencarian Manual di Marketplace (Filter Terisi)")
-        st.write("Belum ada pembanding valid yang lolos filter otomatis. Anda dapat membuka pencarian manual di marketplace berikut dengan filter yang sudah terpasang:")
+        st.write("Belum ada pembanding valid yang lolos filter otomatis atau semua katalog menghasilkan 0 tautan. Anda dapat membuka pencarian manual di marketplace berikut dengan filter yang sudah terpasang:")
         cols = st.columns(3)
         for idx, (m_name, m_url) in enumerate(result.manual_search_urls.items()):
             cols[idx % 3].link_button(f"Buka {m_name}", m_url, use_container_width=True)
@@ -464,6 +504,24 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
     for note in result.final_analysis.catatan:
         st.write(f"- {note}")
 
+    with st.expander("Diagnostik katalog", expanded=False):
+        if getattr(result, "catalog_urls_opened", None):
+            for cat in result.catalog_urls_opened:
+                st.markdown(f"**Domain:** `{cat.get('domain', '-')}` | **Halaman:** {cat.get('page', 1)} | **Status HTTP:** `{cat.get('http_status', '-')}`")
+                st.markdown(f"- **URL Diminta:** [{cat.get('url_requested') or cat.get('url', '-')}]({cat.get('url_requested') or cat.get('url', '-')})")
+                st.markdown(f"- **URL Akhir:** [{cat.get('final_url', '-')}]({cat.get('final_url', '-')})")
+                st.markdown(f"- **Ukuran Respons:** {cat.get('response_bytes', 0):,} byte")
+                st.markdown(f"- **Jumlah Elemen `<a>`:** {cat.get('total_anchors', 0)}")
+                st.markdown(f"- **Tautan Lolos Detail:** {cat.get('detail_links_passed', cat.get('links_found', 0))}")
+                if cat.get('failure_reason'):
+                    st.markdown(f"- **Alasan:** `{cat.get('failure_reason')}`")
+                if cat.get('body_snippet'):
+                    st.markdown("- **200 Karakter Pertama Body (tautan = 0):**")
+                    st.code(cat.get('body_snippet')[:200])
+                st.divider()
+        else:
+            st.caption("Tidak ada log diagnostik katalog (data dimuat dari cache atau URL manual).")
+
     with st.expander("Sumber grounding, katalog, dan data yang dibuang", expanded=False):
         if getattr(result, "catalog_urls_opened", None):
             st.markdown("**Halaman Katalog Marketplace yang Dibuka (URL Terfilter)**")
@@ -478,19 +536,31 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
         else:
             st.caption("Tidak ada kueri grounding (mode katalog langsung / cache).")
 
-        st.markdown("**URL Sumber Grounding / Detail**")
-        if result.sources:
-            for source in result.sources:
-                domain = urlsplit(source.url).netloc
-                st.markdown(f"- [{domain}]({source.url}) - `{source.url}`")
+        st.markdown("**Pembanding Dipakai (Lolos Validasi)**")
+        if result.comparables:
+            for item in result.comparables:
+                dom = urlsplit(item.source_url).netloc
+                st.markdown(f"- [{dom}]({item.source_url}) — {item.brand} {item.model} {item.variant} ({item.year}) - `{item.source_url}`")
         else:
-            st.caption("Metadata grounding tidak mengembalikan URL sumber.")
+            st.caption("Tidak ada pembanding yang lolos validasi.")
+
+        if getattr(result, "grounding_sources", None):
+            st.markdown("**URL dari Grounding Gemini**")
+            for source in result.grounding_sources:
+                dom = urlsplit(source.url).netloc
+                st.markdown(f"- [{dom}]({source.url}) - `{source.url}`")
+
+        if getattr(result, "catalog_detail_links", None):
+            st.markdown(f"**Tautan Ditemukan di Katalog ({len(result.catalog_detail_links)} tautan)**")
+            with st.expander(f"Buka {len(result.catalog_detail_links)} tautan katalog", expanded=False):
+                for lk in result.catalog_detail_links:
+                    st.write(f"- `{lk}`")
 
         st.markdown("**Listing yang Dibuang per Alasan (Dikelompokkan)**")
         if getattr(result, "rejected_by_reason", None):
             for reason, urls in result.rejected_by_reason.items():
                 st.markdown(f"- ❌ **{reason}** ({len(urls)} URL)")
-                with st.expander(f"Daftar URL: {reason}", expanded=False):
+                with st.expander(f"Buka {len(urls)} tautan", expanded=False):
                     for u in urls:
                         st.write(f"- `{u}`")
         elif result.rejected:
@@ -500,7 +570,7 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
                 grouped_rej.setdefault(r_text, []).append(rej.get("source_url", "-"))
             for reason, urls in grouped_rej.items():
                 st.markdown(f"- ❌ **{reason}** ({len(urls)} URL)")
-                with st.expander(f"Daftar URL: {reason}", expanded=False):
+                with st.expander(f"Buka {len(urls)} tautan", expanded=False):
                     for u in urls:
                         st.write(f"- `{u}`")
         else:
@@ -509,8 +579,11 @@ def _render_analysis(result: ScreeningPipelineResult, user_input: dict, copy_but
 
     usage = result.usage
     model_display = result.model_used or "Gemini"
+    succ_calls = usage.get("grounding_calls", 0)
+    fail_calls = usage.get("grounding_failed_calls", 0)
+    calls_str = f"{succ_calls} sukses" + (f" ({fail_calls} percobaan gagal)" if fail_calls > 0 else "")
     st.caption(
-        f"Model AI: **{model_display}** | Analisa harian ke-{result.daily_count} | Panggilan grounding: {usage['grounding_calls']} | "
+        f"Model AI: **{model_display}** | Analisa harian ke-{result.daily_count} | Panggilan grounding: {calls_str} | "
         f"Token input/output/total: {usage['input_tokens']}/{usage['output_tokens']}/{usage['total_tokens']}"
     )
     report = _summary_text(result, user_input)
@@ -738,13 +811,15 @@ def render_app() -> None:
             else:
                 progress = st.progress(0, text="Menyiapkan analisa...")
                 with st.status("🔍 Sedang menjalankan analisa harga & screening...", expanded=True) as status_box:
+                    log_box = status_box.container(height=240)
+
                     def handle_stage(value: int, text: str):
                         progress.progress(value, text=text)
-                        status_box.write(f"**[{value}%]** {text}")
+                        log_box.write(f"**[{value}%]** {text}")
                         status_box.update(label=f"Proses ({value}%): {text}")
 
                     def handle_status(detail: str):
-                        status_box.caption(f"↳ {detail}")
+                        log_box.caption(f"↳ {detail}")
 
                     try:
                         load_dotenv(override=True)
@@ -794,13 +869,31 @@ def render_app() -> None:
                             "Silakan periksa konfigurasi model atau coba beberapa saat lagi."
                         )
                     except Exception as error:
+                        import os
+                        import traceback
                         status_box.update(label="❌ Analisa gagal", state="error", expanded=True)
-                        st.session_state["pipeline_error"] = f"Analisa gagal karena error tak terduga: {error}"
+                        tb_exc = traceback.format_exc()
+                        exc_name = type(error).__name__
+                        tb = error.__traceback__
+                        last_frame = tb
+                        while last_frame and last_frame.tb_next:
+                            last_frame = last_frame.tb_next
+                        lineno = last_frame.tb_lineno if last_frame else "?"
+                        fname = os.path.basename(last_frame.tb_frame.f_code.co_filename) if last_frame else "?"
+                        st.session_state["pipeline_error"] = (
+                            f"Analisa gagal karena error tak terduga: {exc_name}: {error} (pada {fname}:{lineno})"
+                        )
+                        st.session_state["pipeline_debug_tb"] = tb_exc
                     finally:
                         progress.empty()
 
         if st.session_state.get("pipeline_error") and not st.session_state.get("screening_result"):
             st.error(st.session_state["pipeline_error"])
+            if st.session_state.get("pipeline_debug_tb"):
+                with st.expander("🛠️ Detail Debug / Traceback (Pengembang)", expanded=False):
+                    from src.search_provider import mask_api_keys
+                    safe_tb = mask_api_keys(st.session_state["pipeline_debug_tb"])
+                    st.code(safe_tb, language="text")
             st.info("Pencarian tidak menggunakan data tiruan (dummy). Anda dapat mencoba kembali proses analisa:")
             if st.button("🔄 Coba lagi", key="btn_retry_screening", type="primary"):
                 st.session_state["retry_requested"] = True

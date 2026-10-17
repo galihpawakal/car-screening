@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -10,6 +11,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+
+def compute_grounding_cache_key(model: str, query: str) -> str:
+    """Compute deterministic SHA-256 cache key from model name and normalized query string."""
+    normalized_query = " ".join(query.strip().lower().split())
+    raw = f"{model.strip()}:{normalized_query}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class DailyLimitExceeded(RuntimeError):
@@ -35,6 +43,14 @@ class SQLiteAnalysisCache:
                 cache_key TEXT PRIMARY KEY,
                 created_at REAL NOT NULL,
                 payload_json TEXT NOT NULL
+            )""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS grounding_cache (
+                query_key TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                text TEXT NOT NULL,
+                sources_json TEXT NOT NULL,
+                queries_json TEXT NOT NULL,
+                model TEXT NOT NULL
             )""")
             connection.execute("""CREATE TABLE IF NOT EXISTS daily_limits (
                 day TEXT PRIMARY KEY,
@@ -112,6 +128,72 @@ class SQLiteAnalysisCache:
                 "INSERT OR REPLACE INTO query_cache(cache_key, created_at, payload_json) VALUES (?, ?, ?)",
                 (cache_key, moment, encoded),
             )
+
+    def get_grounding(self, query_key: str, *, now: float | None = None) -> dict | None:
+        """Fetch cached grounding result if within TTL (24 hours)."""
+        moment = now if now is not None else datetime.now(timezone.utc).timestamp()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT created_at, text, sources_json, queries_json, model FROM grounding_cache WHERE query_key = ?",
+                (query_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            if moment - row["created_at"] >= self.ttl_seconds:
+                connection.execute("DELETE FROM grounding_cache WHERE query_key = ?", (query_key,))
+                return None
+            return {
+                "text": row["text"],
+                "sources": json.loads(row["sources_json"]),
+                "queries": json.loads(row["queries_json"]),
+                "model": row["model"],
+            }
+
+    def set_grounding(
+        self,
+        query_key: str,
+        *,
+        text: str,
+        sources: list[dict],
+        queries: list[str],
+        model: str,
+        now: float | None = None,
+    ) -> None:
+        """Cache successful non-empty grounding result."""
+        # Only store successful, non-empty results
+        if not text.strip() and not sources:
+            return
+        moment = now if now is not None else datetime.now(timezone.utc).timestamp()
+        sources_json = json.dumps(sources, ensure_ascii=False)
+        queries_json = json.dumps(queries, ensure_ascii=False)
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO grounding_cache(
+                    query_key, created_at, text, sources_json, queries_json, model
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (query_key, moment, text, sources_json, queries_json, model),
+            )
+
+    def set_grounded_search_result(self, query_key: str, result: Any, *, now: float | None = None) -> None:
+        """Convenience method to cache a GroundedSearchResult object."""
+        if not result:
+            return
+        sources = [
+            {
+                "url": s.url,
+                "title": getattr(s, "title", ""),
+                "original_url": getattr(s, "original_url", ""),
+            }
+            for s in getattr(result, "sources", [])
+        ]
+        self.set_grounding(
+            query_key,
+            text=getattr(result, "text", "") or "",
+            sources=sources,
+            queries=getattr(result, "queries", []) or [],
+            model=getattr(result, "model", "") or "",
+            now=now,
+        )
 
     def claim_daily_analysis(self, limit: int, *, day: date | None = None) -> int:
         if limit < 1:

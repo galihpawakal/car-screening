@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
+logger = logging.getLogger(__name__)
+
 from src.analyze import FinalAnalysis, InspectionChecklist, analyze_results, calculate_negotiation_prices
-from src.cache import SQLiteAnalysisCache
+from src.cache import SQLiteAnalysisCache, compute_grounding_cache_key
 from src.clean import CleanResult, RejectedListing, _canonical_url, clean_listings
 from src.config import (
     MARKETPLACE_DOMAINS,
@@ -41,7 +45,7 @@ from src.marketplace_fetcher import (
     fetch_and_parse_details_concurrent,
 )
 from src.tiered_screening import TierEvaluationResult, evaluate_tiered_comparables
-from src.page_reader import extract_listing_from_page, fetch_page_html
+from src.page_reader import PageReadOutcome, extract_listing_from_page, fetch_page_html
 from src.url_classifier import classify_url, extract_detail_links_from_html
 from src.rules import run_all_rules
 from src.scoring import (
@@ -88,6 +92,9 @@ class ScreeningPipelineResult:
     catalog_urls_opened: list[dict] | None = None
     rejected_by_reason: dict[str, list[str]] | None = None
     manual_search_urls: dict[str, str] | None = None
+    debug_error: str | None = None
+    grounding_sources: list[GroundingSource] | None = None
+    catalog_detail_links: list[str] | None = None
 
 
 
@@ -316,18 +323,20 @@ def _fallback_analysis(user_input: dict, statistics: dict, rule_flags: list) -> 
             "Estimasi harga bersifat indikatif. "
             "Jangan putuskan pembelian sebelum meminta bukti harga dan inspeksi langsung."
         )
+    elif abs(price_diff_pct) > 0.50:
+        conclusion = "Harga tidak wajar terhadap pasar; kemungkinan salah ketik, harga DP, atau penipuan. Tidak ada saran negosiasi."
     else:
         conclusion = (
             "Gunakan rentang harga pembanding sebagai indikasi, bukan kepastian transaksi. "
             "Verifikasi seluruh dokumen dan kondisi kendaraan sebelum membayar."
         )
 
-    # Saran negosiasi: hanya jika harga listing di atas pasar
+    # Saran negosiasi: hanya jika harga listing di atas pasar dan wajar
     nego_warning = negotiation_advice_text(price_diff_pct, count)
-    if nego_warning is not None or price_median <= 0:
+    if nego_warning is not None or price_median <= 0 or abs(price_diff_pct) > 0.50:
         saran_nego = calculate_negotiation_prices(None)  # no suggestion
     else:
-        saran_nego = calculate_negotiation_prices(price_median)
+        saran_nego = calculate_negotiation_prices(price_median, listing_price)
 
     questions = [
         "Bisakah Anda menunjukkan STNK, BPKB, dan faktur asli?",
@@ -580,9 +589,42 @@ def run_screening(
     token_input = 0
     token_output = 0
     grounding_calls = 0
+    grounding_succ = 0
+    grounding_fail = 0
     cache_hit = False
     used_model = getattr(provider, "last_used_model", getattr(provider, "model", ""))
     manual_urls = parse_manual_listing_urls(user_input.get("manual_listing_urls"))
+    debug_error: str | None = None
+    grounded_research_text: str = ""
+    warning: str | None = None
+
+    # Inisialisasi awal semua variabel pipeline sebelum percabangan cache / mode pencarian
+    comparables: list[ComparableListing] = []
+    rejected: list[dict] = []
+    sources: list[GroundingSource] = []
+    queries: list[str] = []
+    all_extracted: list[ExtractedListing] = []
+    all_rejected: list[dict] = []
+    all_sources: list[GroundingSource] = []
+    all_queries: list[str] = []
+    already_fetched_urls: set[str] = set()
+    grounding_sources_list: list[GroundingSource] = []
+    catalog_detail_links: list[str] = []
+    catalog_links_list: list[str] = []
+    used_comparables_list: list[ComparableListing] = []
+    funnel = CrawlFunnelMetrics()
+    funnel_metrics: dict[str, Any] | None = None
+    catalog_urls_opened: list[dict[str, Any]] = []
+    rejected_by_reason: dict[str, int] = {}
+    active_tier: int = 1
+    tier_label: str = "Tier 1: Identik Sempurna"
+    manual_search_urls: dict[str, str] = build_manual_search_urls(
+        brand=user_input.get("brand", ""),
+        model=user_input.get("model", ""),
+        year=int(user_input.get("year", current_year)),
+        transmission=user_input.get("transmission", ""),
+    )
+    max_rounds = 1
 
     try:
         notify("Memeriksa cache analisa lokal SQLite...")
@@ -595,40 +637,28 @@ def run_screening(
             cache_hit = True
             stage(38, "Memuat hasil pencarian tersimpan (cache 24 jam)...")
             comparables, rejected, sources, queries, fetched_at = _restore_cache(payload)
+            used_comparables_list = comparables
+            grounding_sources_list = [
+                GroundingSource(**item) if isinstance(item, dict) else item
+                for item in payload.get("grounding_sources", [])
+            ]
+            catalog_detail_links = payload.get("catalog_detail_links", [])
+            catalog_links_list = catalog_detail_links
             used_model = payload.get("model_used") or used_model or "Cache"
             active_tier = payload.get("active_tier", 1)
             tier_label = payload.get("tier_label", "Cache (tersimpan)")
             funnel_metrics = payload.get("funnel_metrics")
             catalog_urls_opened = payload.get("catalog_urls_opened", [])
             rejected_by_reason = payload.get("rejected_by_reason", {})
-            manual_search_urls = payload.get("manual_search_urls") or build_manual_search_urls(
-                brand=user_input["brand"],
-                model=user_input["model"],
-                year=int(user_input["year"]),
-                transmission=user_input.get("transmission", ""),
-            )
+            manual_search_urls = payload.get("manual_search_urls") or manual_search_urls
             notify(f"Data ditemukan di cache: memuat {len(comparables)} pembanding tersimpan.")
         else:
-            all_extracted: list[ExtractedListing] = []
-            all_rejected: list[dict] = []
-            all_sources: list[GroundingSource] = []
-            all_queries: list[str] = []
-            already_fetched_urls: set[str] = set()
-            max_rounds = 1
-
             search_mode = user_input.get("search_mode", "grounding")
-            funnel = CrawlFunnelMetrics()
-            manual_search_urls = build_manual_search_urls(
-                brand=user_input["brand"],
-                model=user_input["model"],
-                year=int(user_input["year"]),
-                transmission=user_input.get("transmission", ""),
-            )
 
             def _crawl_all_marketplaces() -> tuple[list[ExtractedListing], list[dict[str, str]]]:
                 nonlocal used_model
                 domains = ["carmudi.co.id", "carsome.id", "oto.com", "olx.co.id", "mobil123.com", "mobilbekas.com"]
-                collected_links: list[str] = []
+                domain_links: dict[str, list[str]] = {d: [] for d in domains}
                 for d in domains:
                     cfg = MARKETPLACE_CATALOG_CONFIGS.get(d)
                     mp = cfg.max_pages if cfg else 3
@@ -643,14 +673,15 @@ def run_screening(
                         notify=notify,
                         funnel=funnel,
                     )
-                    collected_links.extend(links)
+                    domain_links[d].extend(links)
                     for lk in links:
                         all_sources.append(GroundingSource(url=lk, title=d))
 
                 # If collected links are few (< 8), check twin models
+                total_found = sum(len(v) for v in domain_links.values())
                 twin_models = get_twin_models(user_input["model"])
-                if len(collected_links) < 8 and twin_models:
-                    notify(f"⚡ Kandidat langsung sedikit ({len(collected_links)}), menelusuri katalog model kembar ({', '.join(twin_models)})...")
+                if total_found < 8 and twin_models:
+                    notify(f"⚡ Kandidat langsung sedikit ({total_found}), menelusuri katalog model kembar ({', '.join(twin_models)})...")
                     for twin in twin_models:
                         for d in ["carmudi.co.id", "carsome.id"]:
                             twin_links = crawl_marketplace_catalog(
@@ -664,9 +695,19 @@ def run_screening(
                                 notify=notify,
                                 funnel=funnel,
                             )
-                            collected_links.extend(twin_links)
+                            if d not in domain_links:
+                                domain_links[d] = []
+                            domain_links[d].extend(twin_links)
                             for lk in twin_links:
                                 all_sources.append(GroundingSource(url=lk, title=d))
+
+                # Interleave candidate links round-robin across domains so no single domain starves others
+                max_len = max((len(v) for v in domain_links.values()), default=0)
+                collected_links: list[str] = []
+                for i in range(max_len):
+                    for d in list(domain_links.keys()):
+                        if i < len(domain_links[d]):
+                            collected_links.append(domain_links[d][i])
 
                 # Fetch details concurrently (max 4 workers, max 40 detail fetch)
                 details, rej = fetch_and_parse_details_concurrent(
@@ -707,58 +748,173 @@ def run_screening(
                 used_model = "Pencarian Langsung Marketplace"
                 notify(f"Pencarian langsung selesai: {len(dir_extracted)} listing detail berhasil dibaca.")
             else:
-                for round_num in range(1, max_rounds + 1):
-                    progress_pct = 10 + (round_num - 1) * 15
-                    stage(progress_pct, f"Tahap 1/4: mencari listing di marketplace (Google Search putaran {round_num}/{max_rounds})...")
-                    prompt, query = build_multi_round_search_prompt(user_input, round_num, MARKETPLACE_DOMAINS)
-                    all_queries.append(query)
-                    notify(f"🔍 Putaran {round_num}/{max_rounds}: Google Search: '{query}'...")
+                stage(10, "Tahap 1/4: menjalankan pencarian langsung marketplace & Google Search grounding paralel...")
+                notify("🚀 Menjalankan crawl katalog marketplace dan Google Search grounding secara paralel...")
 
-                    calls_before_search = getattr(provider, "api_calls", 0)
+                grounding_res = {
+                    "extracted": [],
+                    "rejected": [],
+                    "sources": [],
+                    "queries": [],
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "calls": 0,
+                    "model": "",
+                    "research_text": "",
+                    "error": None,
+                }
+                marketplace_res = {"extracted": [], "rejected": []}
+
+                def _run_grounding_task():
+                    g_extracted = []
+                    g_rejected = []
+                    g_sources = []
+                    g_queries = []
+                    g_in = 0
+                    g_out = 0
+                    g_calls = 0
+                    g_model = ""
+                    g_research_text = ""
+                    g_already_fetched: set[str] = set()
+
                     try:
-                        grounded = provider.search(prompt, marketplace=",".join(MARKETPLACE_DOMAINS))
-                    except Exception as error:
-                        grounding_calls += max(0, getattr(provider, "api_calls", calls_before_search) - calls_before_search)
-                        err_str = str(error)
-                        if "tidak tersedia" in err_str or "kuota" in err_str.lower() or "quota" in err_str.lower() or "429" in err_str or "timeout" in err_str.lower():
-                            notify(f"⚠️ {error}. Beralih ke pencarian langsung marketplace...")
-                            break
-                        if round_num == 1:
-                            raise PipelineError("Pencarian", f"Pencarian Gemini gagal setelah retry: {error}") from error
-                        notify(f"⚠️ Pencarian putaran {round_num} gagal: {error}")
-                        break
+                        for round_num in range(1, max_rounds + 1):
+                            prompt, query = build_multi_round_search_prompt(user_input, round_num, MARKETPLACE_DOMAINS)
+                            g_queries.append(query)
+                            g_cache_key = compute_grounding_cache_key(getattr(provider, "model", "gemini"), query)
+                            cached_g = cache.get_grounding(g_cache_key)
 
-                    token_input += grounded.usage.input_tokens
-                    token_output += grounded.usage.output_tokens
-                    grounding_calls += grounded.grounding_calls
-                    used_model = grounded.model or getattr(provider, "last_used_model", getattr(provider, "model", ""))
+                            if cached_g is not None:
+                                cached_sources = [
+                                    GroundingSource(url=s["url"], title=s.get("title", ""), original_url=s.get("original_url", ""))
+                                    for s in cached_g.get("sources", [])
+                                ]
+                                grounded = GroundedSearchResult(
+                                    text=cached_g.get("text", "") or "",
+                                    sources=cached_sources,
+                                    queries=cached_g.get("queries", [query]) or [query],
+                                    usage=TokenUsage(0, 0),
+                                    grounding_calls=0,
+                                    model=cached_g.get("model", "") or getattr(provider, "model", ""),
+                                    marketplace=",".join(MARKETPLACE_DOMAINS),
+                                )
+                            else:
+                                grounded = provider.search(prompt, marketplace=",".join(MARKETPLACE_DOMAINS))
+                                if grounded and (grounded.text or grounded.sources):
+                                    cache.set_grounded_search_result(g_cache_key, grounded)
 
-                    for s in grounded.sources:
-                        if not any(existing.url == s.url for existing in all_sources):
-                            all_sources.append(s)
+                            g_in += grounded.usage.input_tokens
+                            g_out += grounded.usage.output_tokens
+                            g_calls += grounded.grounding_calls
+                            if not g_model and grounded.model:
+                                g_model = grounded.model
+                            if not g_research_text and grounded.text:
+                                g_research_text = grounded.text
 
-                    notify(f"Pencarian putaran {round_num} selesai: {len(grounded.sources)} URL ditemukan.")
-                    stage(progress_pct + 10, f"Tahap 2/4: membaca dan mengekstrak halaman detail (putaran {round_num})...")
+                            for s in grounded.sources:
+                                if not any(existing.url == s.url for existing in g_sources):
+                                    g_sources.append(s)
 
-                    extracted, round_rejected = fetch_and_parse_listings_from_urls(
-                        provider,
-                        grounded.sources,
-                        user_input,
-                        already_fetched_urls,
-                        max_total_fetch=MAX_TOTAL_DETAIL_FETCH,
-                        notify=notify,
-                    )
-                    all_extracted.extend(extracted)
-                    all_rejected.extend(round_rejected)
+                            extr, rej = fetch_and_parse_listings_from_urls(
+                                provider,
+                                grounded.sources,
+                                user_input,
+                                g_already_fetched,
+                                max_total_fetch=MAX_TOTAL_DETAIL_FETCH,
+                                notify=notify,
+                            )
+                            g_extracted.extend(extr)
+                            g_rejected.extend(rej)
+                            if len(g_extracted) >= 5:
+                                break
+                    except Exception as g_err:
+                        return {
+                            "extracted": g_extracted,
+                            "rejected": g_rejected,
+                            "sources": g_sources,
+                            "queries": g_queries,
+                            "tokens_in": g_in,
+                            "tokens_out": g_out,
+                            "calls": g_calls,
+                            "model": g_model,
+                            "research_text": g_research_text,
+                            "error": g_err,
+                        }
 
-                # Fallback to direct marketplace catalog if grounding found insufficient listings
-                if len(all_extracted) < 3:
-                    notify("🔄 Kuota/hasil Google Search terbatas. Menjalankan pencarian langsung katalog marketplace sebagai cadangan...")
-                    dir_extracted, dir_rejected = _crawl_all_marketplaces()
-                    all_extracted.extend(dir_extracted)
-                    all_rejected.extend(dir_rejected)
-                    if not used_model or used_model == "Cache":
-                        used_model = "Pencarian Langsung Marketplace"
+                    return {
+                        "extracted": g_extracted,
+                        "rejected": g_rejected,
+                        "sources": g_sources,
+                        "queries": g_queries,
+                        "tokens_in": g_in,
+                        "tokens_out": g_out,
+                        "calls": g_calls,
+                        "model": g_model,
+                        "research_text": g_research_text,
+                        "error": None,
+                    }
+
+                t_start = time.time()
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    fut_market = executor.submit(_crawl_all_marketplaces)
+                    fut_ground = executor.submit(_run_grounding_task)
+
+                    # Tunggu marketplace selesai (atau max 120 detik)
+                    try:
+                        dir_extracted, dir_rejected = fut_market.result(timeout=120.0)
+                        marketplace_res["extracted"] = dir_extracted
+                        marketplace_res["rejected"] = dir_rejected
+                    except Exception as m_err:
+                        logger.warning("Marketplace crawl gagal atau timeout: %s", m_err)
+
+                    crawl_elapsed = time.time() - t_start
+                    # Deadline grounding 120 dtk tidak boleh menambah waktu tunggu setelah crawl selesai;
+                    # pakai hasil marketplace begitu siap dan jangan menunggu grounding lebih lama dari 30 dtk setelahnya.
+                    remaining_deadline = max(0.0, 120.0 - crawl_elapsed)
+                    wait_grounding = min(remaining_deadline, 30.0)
+
+                    try:
+                        grounding_res = fut_ground.result(timeout=wait_grounding)
+                        if grounding_res.get("error"):
+                            notify(f"⚠️ Google Search grounding mengalami kendala ({grounding_res['error']}). Menggunakan data marketplace.")
+                            fallback_msg = f"Pencarian web grounding tidak tersedia ({grounding_res['error']}); hasil menggunakan pencarian langsung katalog marketplace."
+                            warning = f"{fallback_msg} {warning}" if warning else fallback_msg
+                            debug_error = f"{type(grounding_res['error']).__name__}: {grounding_res['error']}"
+                    except TimeoutError:
+                        notify("⏱️ Batas waktu grounding (maks 30s setelah crawl selesai) tercapai. Melanjutkan dengan hasil marketplace.")
+                        warning = "Pencarian grounding melampaui batas waktu 30s setelah crawl selesai; hasil menggunakan katalog marketplace."
+                    except Exception as g_exc:
+                        logger.warning("Grounding thread error: %s", g_exc)
+                        fallback_msg = f"Pencarian web grounding tidak tersedia ({g_exc}); hasil menggunakan pencarian langsung katalog marketplace."
+                        warning = f"{fallback_msg} {warning}" if warning else fallback_msg
+                        debug_error = f"{type(g_exc).__name__}: {g_exc}"
+
+                # Gabungkan hasil crawl dan grounding
+                token_input += grounding_res["tokens_in"]
+                token_output += grounding_res["tokens_out"]
+                grounding_calls += grounding_res["calls"]
+                if grounding_res["model"]:
+                    used_model = grounding_res["model"]
+                elif not used_model:
+                    used_model = "Pencarian Langsung Marketplace"
+                grounded_research_text = grounding_res["research_text"]
+                all_queries.extend(grounding_res["queries"])
+                grounding_sources_list.extend(grounding_res["sources"])
+
+                seen_extracted_urls = set()
+                for item in marketplace_res["extracted"]:
+                    u = _canonical_url(item.source_url)
+                    if u not in seen_extracted_urls:
+                        seen_extracted_urls.add(u)
+                        all_extracted.append(item)
+                for item in grounding_res["extracted"]:
+                    u = _canonical_url(item.source_url)
+                    if u not in seen_extracted_urls:
+                        seen_extracted_urls.add(u)
+                        all_extracted.append(item)
+
+                all_rejected.extend(marketplace_res["rejected"])
+                all_rejected.extend(grounding_res["rejected"])
 
             stage(48, "Tahap 3/4: memvalidasi listing dengan tiered fallback (Tier 1-4)...")
             notify("Memvalidasi listing dan mengelompokkan ke dalam tingkatan (Tier 1-4)...")
@@ -833,15 +989,41 @@ def run_screening(
                 except Exception as save_err:
                     logger.debug("Gagal menyimpan listing ke database pasar: %s", save_err)
 
-            # Aggregate all rejected items into rejected list
-            flat_rejected: list[dict] = list(all_rejected)
+            # Add any detail fetch/parsing failures to rejected_by_reason
+            for rej in all_rejected:
+                r_reason = rej.get("reason") or "Gagal membaca detail halaman"
+                r_url = rej.get("source_url") or "-"
+                rejected_by_reason.setdefault(r_reason, []).append(r_url)
+
+            # Invariant check: detail_terbaca == lolos + sum(dibuang per alasan)
+            total_rejected_count = sum(len(urls) for urls in rejected_by_reason.values())
+            total_detail_candidates = len(all_extracted) + len(all_rejected)
+            if total_detail_candidates != len(comparables) + total_rejected_count:
+                logger.error(
+                    "INVARIANT VIOLATION: detail candidates (%d) != comparables (%d) + rejected (%d)",
+                    total_detail_candidates,
+                    len(comparables),
+                    total_rejected_count,
+                )
+
+            # Flat list of all rejected items
+            flat_rejected: list[dict] = []
             for reason, urls in rejected_by_reason.items():
                 for u in urls:
                     flat_rejected.append({"source_url": u, "reason": reason})
 
             rejected = flat_rejected
-            sources = all_sources
+            # 'sources' only contains valid comparables used in the analysis
+            comparable_sources = [
+                GroundingSource(url=c.source_url, title=urlsplit(c.source_url).netloc)
+                for c in comparables
+            ]
+            sources = comparable_sources
             queries = all_queries
+            catalog_detail_links = [s.url for s in all_sources if s not in grounding_sources_list]
+            catalog_links_list = catalog_detail_links
+            used_comparables_list = comparables
+            logger.debug("Valid comparables: %d, catalog links: %d", len(used_comparables_list), len(catalog_links_list))
             funnel_metrics = {
                 "catalog_urls_opened": len(funnel.catalog_urls_opened),
                 "detail_links_found": funnel.detail_links_found,
@@ -864,6 +1046,15 @@ def run_screening(
                     }
                     for source in sources
                 ],
+                "grounding_sources": [
+                    {
+                        "url": s.url,
+                        "title": s.title or urlsplit(s.url).netloc,
+                        "original_url": getattr(s, "original_url", "") or "",
+                    }
+                    for s in grounding_sources_list
+                ],
+                "catalog_detail_links": catalog_detail_links,
                 "queries": queries,
                 "fetched_at": fetched_at,
                 "model_used": used_model,
@@ -897,18 +1088,20 @@ def run_screening(
         statistics["listing_percentile"] = calculate_listing_percentile(
             comparables, int(user_input["listing_price"])
         )
-        warning = None
         n_count = statistics["count"]
+        stat_warning = None
         if n_count < MIN_COMPARABLES:
-            warning = (
+            stat_warning = (
                 f"Pembanding valid kurang dari {MIN_COMPARABLES} ({n_count}). "
                 "Skor angka tidak dihitung; rentang harga berkeyakinan sangat rendah."
             )
         elif n_count < SOLID_COMPARABLES:
-            warning = (
+            stat_warning = (
                 f"Indikatif - data sangat sedikit ({n_count} pembanding). "
                 "Rentang harga dan skor pasar berkeyakinan rendah."
             )
+        if stat_warning:
+            warning = f"{warning} {stat_warning}" if warning else stat_warning
 
         # Price banner warning for extremely cheap listings (only if comparables >= 3)
         _price_banner = price_banner_warning(
@@ -942,14 +1135,21 @@ def run_screening(
             if description:
                 analysis_input["deskripsi"] = description
             try:
-                final_analysis, usage = analyze_results(provider, analysis_input, statistics, comparables)
+                final_analysis, usage = analyze_results(
+                    provider,
+                    analysis_input,
+                    statistics,
+                    comparables,
+                    research_text=grounded_research_text,
+                )
                 token_input += usage.input_tokens
                 token_output += usage.output_tokens
                 notify("Analisa akhir terstruktur selesai disusun.")
             except Exception as error:
-                ai_error = (
-                    f"Analisa akhir Gemini gagal setelah retry; hasil statistik dan aturan tetap tersedia: {error}"
-                )
+                final_analysis = _fallback_analysis(user_input, statistics, rule_flags)
+                ai_error = "Analisa AI tidak tersedia, memakai ringkasan aturan"
+                debug_error = f"{type(error).__name__}: {error}"
+                logger.warning("Analisa akhir AI gagal: %s", error)
         elif n_count >= MIN_COMPARABLES:
             # Mode indikatif: skip LLM call untuk hemat token, pakai fallback analysis
             ai_error = (
@@ -986,8 +1186,12 @@ def run_screening(
         screening = format_screening_result(score_result)
         if statistics["count"] == 0:
             screening["price_label"] = "Data tidak cukup"
+        unique_domains = {urlsplit(c.source_url).netloc for c in comparables if getattr(c, "source_url", None)}
         confidence = get_market_confidence(
-            statistics["count"], statistics["price_spread_ratio"], completeness_pct
+            statistics["count"],
+            statistics["price_spread_ratio"],
+            completeness_pct,
+            unique_domains_count=len(unique_domains),
         )
         if not description:
             confidence["reason"] += " Deskripsi kosong; analisa deskripsi oleh LLM dilewati."
@@ -1001,6 +1205,10 @@ def run_screening(
         else:
             completion_status = "tidak ada data valid"
             stage(100, "Analisa selesai tanpa data valid.")
+
+        attempts = getattr(provider, "attempt_history", [])
+        grounding_succ = sum(1 for a in attempts if a.get("success") and a.get("http_code") == 200)
+        grounding_fail = sum(1 for a in attempts if not a.get("success") and a.get("category") != "skipped")
 
         result = ScreeningPipelineResult(
             comparables=comparables,
@@ -1017,7 +1225,8 @@ def run_screening(
             cache_hit=cache_hit,
             daily_count=daily_count,
             usage={
-                "grounding_calls": grounding_calls,
+                "grounding_calls": grounding_succ if grounding_succ > 0 else grounding_calls,
+                "grounding_failed_calls": grounding_fail,
                 "input_tokens": token_input,
                 "output_tokens": token_output,
                 "total_tokens": token_input + token_output,
@@ -1031,6 +1240,9 @@ def run_screening(
             catalog_urls_opened=catalog_urls_opened,
             rejected_by_reason=rejected_by_reason,
             manual_search_urls=manual_search_urls,
+            debug_error=debug_error,
+            grounding_sources=grounding_sources_list,
+            catalog_detail_links=catalog_detail_links,
         )
 
 

@@ -62,17 +62,34 @@ def _robots_allows(url: str, opener: Callable[..., object] | None = None) -> boo
     return parser.can_fetch(ROBOTS_USER_AGENT, url) or parser.can_fetch("*", url)
 
 
-def fetch_page_html(
+@dataclass(frozen=True)
+class PageFetchResponse:
+    url_requested: str
+    final_url: str
+    status: int
+    response_bytes: int
+    html: str
+    error: str | None = None
+
+
+def fetch_page_response(
     url: str,
     *,
     timeout: float = 6.0,
-    retries: int = 2,
+    retries: int = 1,
     delay: float = 0.25,
     opener: Callable[..., object] | None = None,
-) -> str:
-    """Fetch raw HTML content with timeout, retries, short delay, and robots.txt check."""
+) -> PageFetchResponse:
+    """Fetch URL and return status code, final URL, response bytes, and HTML."""
     if not _robots_allows(url, opener=opener):
-        raise PermissionError("robots.txt melarang fetch URL ini")
+        return PageFetchResponse(
+            url_requested=url,
+            final_url=url,
+            status=403,
+            response_bytes=0,
+            html="",
+            error="robots.txt melarang fetch URL ini",
+        )
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -88,12 +105,35 @@ def fetch_page_html(
         try:
             request = Request(url, headers=headers)
             with open_fn(request, timeout=timeout) as response:
+                final_url = response.geturl() if hasattr(response, "geturl") else url
                 status = getattr(response, "status", 200)
-                if status == 403:
-                    raise PermissionError("Akses ditolak (HTTP 403)")
                 raw = response.read(MAX_PAGE_BYTES)
-            return raw.decode("utf-8", errors="ignore")
-        except (HTTPError, URLError, TimeoutError, OSError) as error:
+                html = raw.decode("utf-8", errors="ignore")
+                return PageFetchResponse(
+                    url_requested=url,
+                    final_url=final_url,
+                    status=status,
+                    response_bytes=len(raw),
+                    html=html,
+                )
+        except HTTPError as error:
+            last_error = error
+            final_url = error.geturl() if hasattr(error, "geturl") else url
+            body_bytes = b""
+            try:
+                body_bytes = error.read(MAX_PAGE_BYTES)
+                html = body_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                html = ""
+            return PageFetchResponse(
+                url_requested=url,
+                final_url=final_url,
+                status=error.code,
+                response_bytes=len(body_bytes),
+                html=html,
+                error=f"HTTP Error {error.code}: {error.reason}",
+            )
+        except (URLError, TimeoutError, OSError) as error:
             last_error = error
             logger.debug("Fetch attempt %d failed for %s: %s", attempt + 1, url, error)
             continue
@@ -101,7 +141,34 @@ def fetch_page_html(
             last_error = error
             break
 
-    raise last_error or RuntimeError(f"Gagal memuat URL setelah {retries} retry")
+    err_str = str(last_error or "Koneksi gagal")
+    return PageFetchResponse(
+        url_requested=url,
+        final_url=url,
+        status=0,
+        response_bytes=0,
+        html="",
+        error=err_str,
+    )
+
+
+def fetch_page_html(
+    url: str,
+    *,
+    timeout: float = 6.0,
+    retries: int = 2,
+    delay: float = 0.25,
+    opener: Callable[..., object] | None = None,
+) -> str:
+    """Fetch raw HTML content with timeout, retries, short delay, and robots.txt check."""
+    resp = fetch_page_response(url, timeout=timeout, retries=retries, delay=delay, opener=opener)
+    if resp.status == 200 and resp.html:
+        return resp.html
+    if resp.status == 403:
+        raise PermissionError("Akses ditolak (HTTP 403)")
+    if resp.error:
+        raise RuntimeError(f"Gagal memuat URL ({resp.status}): {resp.error}")
+    raise RuntimeError(f"Gagal memuat URL dengan status {resp.status}")
 
 
 def fetch_page_text(

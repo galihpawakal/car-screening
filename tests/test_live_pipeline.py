@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from src.analyze import FinalAnalysis, analyze_results, calculate_negotiation_prices, sanitize_numeric_claims
+from src.analyze import FinalAnalysis, InspectionChecklist, NegotiationAdvice, analyze_results, calculate_negotiation_prices, sanitize_numeric_claims
 from src.cache import DailyLimitExceeded, SQLiteAnalysisCache
 from src.clean import clean_listings
 from src.extract import (
@@ -663,6 +663,7 @@ class TestGeminiResilienceAndFallback:
                 raise ServerError503(f"Server overload 503 on model {model}")
 
         monkeypatch.setattr("src.search_provider.time.sleep", lambda _: None)
+        monkeypatch.setattr("src.pipeline.crawl_marketplace_catalog", lambda *args, **kwargs: [])
         provider = GeminiGroundingProvider(
             client=SimpleNamespace(interactions=MockAllFailInteractions()),
             model="gemini-3.8-flash",
@@ -674,7 +675,8 @@ class TestGeminiResilienceAndFallback:
         with pytest.raises(RuntimeError, match="Semua model Gemini .* gagal setelah retry"):
             provider.search("Cari Avanza")
 
-        # In pipeline, this must raise PipelineError on stage 'Pencarian' and NOT return dummy data
+        # In pipeline, when grounding fails across all models, it falls back to direct marketplace
+        # search with warning instead of crashing with PipelineError on 'Pencarian'
         cache = SQLiteAnalysisCache(tmp_path / "test_no_dummy.sqlite3")
         user_input = {
             "brand": "Toyota",
@@ -688,16 +690,17 @@ class TestGeminiResilienceAndFallback:
             "location": "Jakarta Selatan",
             "plate_code": "B",
         }
-        with pytest.raises(PipelineError) as exc_info:
-            run_screening(
-                provider=provider,
-                cache=cache,
-                user_input=user_input,
-                daily_limit=5,
-                current_year=2026,
-            )
-        assert exc_info.value.stage == "Pencarian"
-        assert "Semua model Gemini" in str(exc_info.value)
+        result = run_screening(
+            provider=provider,
+            cache=cache,
+            user_input=user_input,
+            daily_limit=5,
+            current_year=2026,
+        )
+        assert result is not None
+        assert result.warning is not None
+        assert "tidak tersedia" in result.warning
+        assert result.debug_error is not None
         # Verify no cache was written for failed search
         assert cache.get(query_cache_key(user_input, 2026)) is None
 
